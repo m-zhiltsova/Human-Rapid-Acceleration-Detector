@@ -2,11 +2,12 @@ import argparse
 import cv2
 import torch
 import numpy as np
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 import onnxruntime as ort
 from moge.model.v2 import MoGeModel
-from yolox.tracker.byte_tracker import BYTETracker, STrack
+from yolox.tracker.byte_tracker import BYTETracker
+import time
 
 # ------------------------- YOLOv8Detector -------------------------
 class YOLOv8Detector:
@@ -102,22 +103,70 @@ class ByteTracker:
             online_targets = self.tracker.update(detections, img_shape, img_shape)
         return online_targets
 
+# ------------------------- KalmanTracker -------------------------
+class KalmanTracker:
+    """Фильтр Калмана для сглаживания траектории и оценки скорости."""
+    def __init__(self, dt=1.0, min_speed=0.1):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], np.float32)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.001
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.initialized = False
+        self.last_update_time = None
+        self.dt = dt
+        self.min_speed = min_speed
+
+    def update(self, measurement, timestamp):
+        if not self.initialized:
+            self.kf.statePost = np.array([
+                [measurement[0]],
+                [measurement[1]],
+                [0],
+                [0]
+            ], np.float32)
+            self.initialized = True
+            self.last_update_time = timestamp
+            return measurement[0], measurement[1], 0.0
+
+        if self.last_update_time is not None:
+            dt_real = max(0.01, timestamp - self.last_update_time)
+            self.kf.transitionMatrix[0, 2] = dt_real
+            self.kf.transitionMatrix[1, 3] = dt_real
+
+        self.kf.predict()
+        measured = np.array([[measurement[0]], [measurement[1]]], np.float32)
+        self.kf.correct(measured)
+
+        state = self.kf.statePost
+        x, z, vx, vz = state[0, 0], state[1, 0], state[2, 0], state[3, 0]
+        speed = np.sqrt(vx**2 + vz**2)
+        if speed < self.min_speed:
+            speed = 0.0
+        self.last_update_time = timestamp
+        return x, z, speed   # <-- обязательно возвращаем три значения
+    
+    
+        
+
 # ------------------------- SpeedEstimator (улучшенный) -------------------------
 class SpeedEstimator:
-    def __init__(self, fps=30, speed_interval_sec=2.0, pos_smooth_window=5, speed_smooth_alpha=0.3):
+    def __init__(self, fps=30, min_movement=0.2):
         self.fps = fps
-        self.speed_interval_frames = int(fps * speed_interval_sec)
-        self.pos_smooth_window = pos_smooth_window
-        self.speed_smooth_alpha = speed_smooth_alpha
-
-        # История сглаженных позиций: deque из (frame_id, x, z)
-        self.history = defaultdict(lambda: deque(maxlen=self.pos_smooth_window * 2))
-        # Сырые позиции для сглаживания координат: deque из (x, z)
-        self.raw_positions = defaultdict(lambda: deque(maxlen=pos_smooth_window))
-        # Последнее вычисление скорости
-        self.last_speed_calc_frame = defaultdict(int)
-        # Текущие скорости (после фильтрации)
-        self.current_speeds = {}
+        self.min_movement = min_movement
+        self.trackers = {}          # track_id -> KalmanTracker
+        self.current_speeds = {}    # track_id -> speed (m/s)
+        self.last_use_time = {}     # track_id -> timestamp (для очистки)
+        self.timeout = 10.0         # секунд без обновлений до удаления трекера
 
     def _world_coordinates(self, bbox, points_map, mask_map=None):
         x1, y1, x2, y2 = bbox
@@ -126,8 +175,8 @@ class SpeedEstimator:
         cy = int(y2)
         cx = max(0, min(cx, w - 1))
         cy = max(0, min(cy, h - 1))
+
         if mask_map is not None and not mask_map[cy, cx]:
-            # Поиск ближайшего валидного пикселя в окне 5x5
             for dy in range(-5, 6):
                 for dx in range(-5, 6):
                     ny, nx = cy + dy, cx + dx
@@ -137,67 +186,38 @@ class SpeedEstimator:
                 else:
                     continue
                 break
+
         point = points_map[cy, cx]
-        return point[0], point[1], point[2]  # (x, y, z)
+        return point[0], point[1], point[2]  # x, y, z
 
-    def update(self, track_id, bbox, points_map, mask_map, frame_id):
-        # Получаем сырую позицию
+    def update(self, track_id, bbox, points_map, mask_map, frame_id, timestamp=None):
+        if timestamp is None:
+            timestamp = frame_id / self.fps
+
         world_pos = self._world_coordinates(bbox, points_map, mask_map)
-        # Сохраняем в буфер для сглаживания
-        self.raw_positions[track_id].append((world_pos[0], world_pos[2]))
+        x_raw, y_raw, z_raw = world_pos
 
-        # Вычисляем сглаженную позицию (среднее по окну)
-        if len(self.raw_positions[track_id]) >= self.pos_smooth_window:
-            avg_x = np.mean([p[0] for p in self.raw_positions[track_id]])
-            avg_z = np.mean([p[1] for p in self.raw_positions[track_id]])
-            smooth_pos = (avg_x, avg_z)
-        else:
-            smooth_pos = (world_pos[0], world_pos[2])
+        if track_id not in self.trackers:
+            self.trackers[track_id] = KalmanTracker(dt=1.0/self.fps, min_speed=self.min_movement)
 
-        # Сохраняем сглаженную позицию в историю
-        self.history[track_id].append((frame_id, smooth_pos[0], smooth_pos[1]))
+        tracker = self.trackers[track_id]
+        x_f, z_f, speed = tracker.update([x_raw, z_raw], timestamp)
 
-        # Проверяем, пора ли пересчитать скорость
-        if frame_id - self.last_speed_calc_frame[track_id] >= self.speed_interval_frames:
-            speed = self._compute_speed(track_id, frame_id)
-            # Экспоненциальное сглаживание скорости
-            prev_speed = self.current_speeds.get(track_id)
-            if prev_speed is not None:
-                speed = self.speed_smooth_alpha * speed + (1 - self.speed_smooth_alpha) * prev_speed
-            self.current_speeds[track_id] = speed
-            self.last_speed_calc_frame[track_id] = frame_id
-            return speed
-        return None
+        self.current_speeds[track_id] = speed
+        self.last_use_time[track_id] = timestamp
 
-    def _compute_speed(self, track_id, current_frame_id):
-        hist = list(self.history[track_id])
-        if len(hist) < 2:
-            return 0.0
-
-        # Берём точки, попадающие в интервал
-        min_frame_id = current_frame_id - self.speed_interval_frames
-        # Находим самую раннюю точку в интервале
-        early_idx = 0
-        for i, (fid, _, _) in enumerate(hist):
-            if fid >= min_frame_id:
-                early_idx = i
-                break
-        early_frame, early_x, early_z = hist[early_idx]
-        late_frame, late_x, late_z = hist[-1]
-
-        if late_frame == early_frame:
-            return 0.0
-
-        dt = (late_frame - early_frame) / self.fps
-        if dt <= 0:
-            return 0.0
-
-        distance = np.sqrt((late_x - early_x)**2 + (late_z - early_z)**2)
-        speed = distance / dt  # м/с
+        self._cleanup(timestamp)
         return speed
 
     def get_speed(self, track_id):
-        return self.current_speeds.get(track_id, None)
+        return self.current_speeds.get(track_id, 0.0)
+
+    def _cleanup(self, current_time):
+        to_delete = [tid for tid, t in self.last_use_time.items() if current_time - t > self.timeout]
+        for tid in to_delete:
+            del self.trackers[tid]
+            del self.current_speeds[tid]
+            del self.last_use_time[tid]
 
 # ------------------------- Отрисовка -------------------------
 def draw_bbox_with_speed(img, bbox, speed=None, color=(0, 255, 0), thickness=2):
@@ -213,13 +233,13 @@ def draw_bbox_with_speed(img, bbox, speed=None, color=(0, 255, 0), thickness=2):
 # ------------------------- main -------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Speed Estimation Pipeline with MoGe")
-    parser.add_argument("--input", type=str, required=True, help="Path to input video")
+    parser.add_argument("--input", type=str, required=True, help="Path to input video or RTSP URL")
     parser.add_argument("--output", type=str, default="output.avi", help="Path to output video")
     parser.add_argument("--det_model", type=str, default="yolov8s_576x1024_v3.onnx", help="YOLOv8 ONNX model path")
     parser.add_argument("--conf", type=float, default=0.3, help="Detection confidence threshold")
-    parser.add_argument("--speed_interval", type=float, default=2.0, help="Speed calculation interval (seconds)")
     parser.add_argument("--moge_interval", type=float, default=1.0, help="MoGe inference interval (seconds)")
     parser.add_argument("--device", type=str, default="cuda", help="Device for MoGe and YOLO (cuda/cpu)")
+    parser.add_argument("--min_movement", type=float, default=0.2, help="Minimum movement in meters to consider non-zero speed")
     return parser.parse_args()
 
 def main():
@@ -229,20 +249,19 @@ def main():
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
-        print("Error: Cannot open video.")
+        print("Error: Cannot open video source.")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
 
     detector = YOLOv8Detector(args.det_model, conf_thres=args.conf, input_size=(1024, 576))
     tracker = ByteTracker(frame_rate=fps)
-    speed_estimator = SpeedEstimator(fps=fps, speed_interval_sec=args.speed_interval)
+    speed_estimator = SpeedEstimator(fps=fps, min_movement=args.min_movement)
 
     print("Loading MoGe model...")
     moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
@@ -255,18 +274,17 @@ def main():
     points = None
     mask = None
 
-    print("Processing video...")
+    print("Processing...")
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame_id += 1
 
-        # Детекция и трекинг
         detections = detector.detect(frame)
         online_targets = tracker.update(detections, (height, width))
 
-        # Вызов MoGe с интервалом
+        # Вызов MoGe с заданным интервалом
         if frame_id - last_moge_frame >= moge_interval_frames:
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             input_tensor = torch.tensor(img_rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -285,15 +303,13 @@ def main():
                 bbox = (x1, y1, x2, y2)
                 track_id = t.track_id
 
-                speed_updated = speed_estimator.update(track_id, bbox, points, mask, frame_id)
-                # Отображаем последнюю известную скорость
-                display_speed = speed_estimator.get_speed(track_id)
-                draw_bbox_with_speed(frame, bbox, display_speed)
+                speed = speed_estimator.update(track_id, bbox, points, mask, frame_id)
+                draw_bbox_with_speed(frame, bbox, speed)
 
         out.write(frame)
 
         if frame_id % 100 == 0:
-            print(f"Processed {frame_id} / {total_frames} frames")
+            print(f"Processed {frame_id} frames")
 
     cap.release()
     out.release()
