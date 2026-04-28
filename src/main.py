@@ -1,319 +1,576 @@
-import argparse
-import cv2
-import torch
+import os, sys, cv2, json, time, argparse, subprocess
+from collections import deque
 import numpy as np
-from collections import defaultdict
-from dataclasses import dataclass
+if not hasattr(np, 'float'):
+    np.float = float
 import onnxruntime as ort
-from moge.model.v2 import MoGeModel
+from pathlib import Path
+from dataclasses import dataclass
 from yolox.tracker.byte_tracker import BYTETracker
-import time
 
-# ------------------------- YOLOv8Detector -------------------------
+
+# ------------------------------------------------------------------ #
+#  Inline depth estimation (optional)                                 #
+# ------------------------------------------------------------------ #
+def run_depth_estimator(empty_frame, camera_id, device,
+                        clahe=0.0, denoise=0.0, sharpen=0.0):
+    script = Path(__file__).parent / 'depth_estimator.py'
+    if not script.exists():
+        print(f"[ERROR] depth_estimator.py not found next to this script ({script})")
+        sys.exit(1)
+    cmd = [
+        sys.executable, str(script),
+        '--input',     str(empty_frame),
+        '--camera_id', str(camera_id),
+        '--device',    str(device),
+    ]
+    if clahe   > 0: cmd += ['--clahe',   str(clahe)]
+    if denoise > 0: cmd += ['--denoise', str(denoise)]
+    if sharpen > 0: cmd += ['--sharpen', str(sharpen)]
+    print(f"[depth] Running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+
+# ------------------------------------------------------------------ #
+#  Image filters                                                      #
+# ------------------------------------------------------------------ #
+def apply_filters(frame, clahe_clip=0.0, denoise_h=0.0, sharpen_amount=0.0):
+    if clahe_clip > 0:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        frame = cv2.cvtColor(cv2.merge([l,a,b]), cv2.COLOR_Lab2BGR)
+    if denoise_h > 0:
+        frame = cv2.fastNlMeansDenoisingColored(frame, None, denoise_h, denoise_h, 7, 21)
+    if sharpen_amount > 0:
+        blurred = cv2.GaussianBlur(frame, (0,0), 3)
+        frame = cv2.addWeighted(frame, 1.0 + sharpen_amount, blurred, -sharpen_amount, 0)
+    return frame
+
+
+# ------------------------------------------------------------------ #
+#  YOLOv8 Detector                                                    #
+# ------------------------------------------------------------------ #
 class YOLOv8Detector:
-    def __init__(self, model_path, conf_thres=0.5, iou_thres=0.45, input_size=(1024, 576)):
-        self.session = ort.InferenceSession(model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    PERSON_CLASS_ID = 0
+    NMS_THRESHOLD = 0.45
+    MODEL_INPUT_SHAPE = (704, 1280)
+
+    def __init__(self, model_path, conf_thres=0.1, device='cuda'):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        print(f"[YOLO] Providers: {self.session.get_providers()}")
         self.conf_threshold = conf_thres
-        self.iou_threshold = iou_thres
-        self.input_width, self.input_height = input_size
         self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.output_name = self.session.get_outputs()[0].name
 
-    def preprocess(self, img):
-        self.img_height, self.img_width = img.shape[:2]
-        r = min(self.input_width / self.img_width, self.input_height / self.img_height)
-        new_w, new_h = int(self.img_width * r), int(self.img_height * r)
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
-        pad_x = (self.input_width - new_w) // 2
-        pad_y = (self.input_height - new_h) // 2
-        canvas[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
-        blob = canvas.astype(np.float32) / 255.0
-        blob = blob.transpose(2, 0, 1)
-        blob = np.expand_dims(blob, axis=0)
-        self.scale = r
-        self.pad_x, self.pad_y = pad_x, pad_y
-        return blob
+    def _letterbox(self, img, new_shape=MODEL_INPUT_SHAPE, color=(114, 114, 114)):
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw /= 2; dh /= 2
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, r, (dw, dh)
 
-    def postprocess(self, outputs):
-        predictions = outputs[0][0].transpose()
-        boxes = []
-        confidences = []
-        for pred in predictions:
-            cx, cy, w, h = pred[:4]
-            class_scores = pred[4:]
-            class_id = np.argmax(class_scores)
-            confidence = class_scores[class_id]
-            if class_id == 0 and confidence > self.conf_threshold:
-                x1 = cx - w/2
-                y1 = cy - h/2
-                x2 = cx + w/2
-                y2 = cy + h/2
-                x1 = (x1 - self.pad_x) / self.scale
-                y1 = (y1 - self.pad_y) / self.scale
-                x2 = (x2 - self.pad_x) / self.scale
-                y2 = (y2 - self.pad_y) / self.scale
-                x1 = max(0, min(x1, self.img_width))
-                y1 = max(0, min(y1, self.img_height))
-                x2 = max(0, min(x2, self.img_width))
-                y2 = max(0, min(y2, self.img_height))
-                if x2 > x1 and y2 > y1:
-                    boxes.append([x1, y1, x2, y2])
-                    confidences.append(float(confidence))
-        if boxes:
-            indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_threshold, self.iou_threshold)
-            if len(indices) > 0:
-                boxes = [boxes[i] for i in indices.flatten()]
-                confidences = [confidences[i] for i in indices.flatten()]
-            else:
-                boxes, confidences = [], []
-        return boxes, confidences
+    def _preprocess(self, frame):
+        img, ratio, pad = self._letterbox(frame, self.MODEL_INPUT_SHAPE)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_norm = img_rgb.astype(np.float32) / 255.0
+        img_tensor = np.transpose(img_norm, (2, 0, 1))
+        img_tensor = np.expand_dims(img_tensor, axis=0)
+        return img_tensor, ratio, pad
+
+    def _postprocess(self, output, orig_shape, ratio, pad):
+        detections = output[0]
+        if detections.shape[1] == 0:
+            return np.empty((0, 5))
+        if detections.shape[0] == 5:
+            boxes = detections[:4, :]
+            scores = detections[4:5, :]
+            person_scores = scores[0, :]
+        else:
+            boxes = detections[:4, :]
+            scores = detections[4:, :]
+            if scores.shape[0] == 0:
+                return np.empty((0, 5))
+            person_scores = scores[self.PERSON_CLASS_ID, :]
+        valid_idx = np.where(person_scores > self.conf_threshold)[0]
+        if len(valid_idx) == 0:
+            return np.empty((0, 5))
+        h_input, w_input = self.MODEL_INPUT_SHAPE
+        boxes_xyxy, confidences = [], []
+        for idx in valid_idx:
+            cx, cy, w, h = boxes[:, idx]
+            x1 = max(0, min(cx - w/2, w_input))
+            y1 = max(0, min(cy - h/2, h_input))
+            x2 = max(0, min(cx + w/2, w_input))
+            y2 = max(0, min(cy + h/2, h_input))
+            boxes_xyxy.append([x1, y1, x2, y2])
+            confidences.append(person_scores[idx])
+        boxes_xywh = [[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in boxes_xyxy]
+        indices = cv2.dnn.NMSBoxes(boxes_xywh, confidences, self.conf_threshold, self.NMS_THRESHOLD)
+        if len(indices) == 0:
+            return np.empty((0, 5))
+        r, (dw, dh) = ratio, pad
+        final_dets = []
+        for i in indices.flatten():
+            x1, y1, w, h = boxes_xywh[i]
+            x1 = (x1 - dw) / r; y1 = (y1 - dh) / r
+            w /= r;              h /= r
+            x2, y2 = x1 + w, y1 + h
+            x1 = max(0, min(x1, orig_shape[1]))
+            y1 = max(0, min(y1, orig_shape[0]))
+            x2 = max(0, min(x2, orig_shape[1]))
+            y2 = max(0, min(y2, orig_shape[0]))
+            final_dets.append([x1, y1, x2, y2, confidences[i]])
+        return np.array(final_dets)
 
     def detect(self, img):
-        blob = self.preprocess(img)
-        outputs = self.session.run(self.output_names, {self.input_name: blob})
-        boxes, confidences = self.postprocess(outputs)
-        detections = []
-        for box, conf in zip(boxes, confidences):
-            detections.append([box[0], box[1], box[2], box[3], conf])
-        return np.array(detections) if detections else np.empty((0, 5))
+        img_tensor, ratio, pad = self._preprocess(img)
+        outputs = self.session.run([self.output_name], {self.input_name: img_tensor})
+        return self._postprocess(outputs[0], img.shape[:2], ratio, pad)
 
-# ------------------------- ByteTracker -------------------------
+
+# ------------------------------------------------------------------ #
+#  ByteTracker                                                        #
+# ------------------------------------------------------------------ #
 @dataclass
 class ByteTrackerArgs:
-    track_thresh: float = 0.5
-    track_buffer: int = 30
-    match_thresh: float = 0.8
+    track_thresh:        float = 0.5
+    track_buffer:        int   = 60
+    match_thresh:        float = 0.9
     aspect_ratio_thresh: float = 1.6
-    min_box_area: float = 10
-    mot20: bool = False
+    min_box_area:        float = 10
+    mot20:               bool  = False
 
 class ByteTracker:
-    def __init__(self, args=None, frame_rate=30):
-        if args is None:
-            args = ByteTrackerArgs()
-        self.tracker = BYTETracker(args, frame_rate=frame_rate)
+    def __init__(self, frame_rate=30):
+        self.tracker  = BYTETracker(ByteTrackerArgs(), frame_rate=frame_rate)
         self.frame_id = 0
 
-    def update(self, detections, img_shape):
+    def update(self, dets, img_shape):
         self.frame_id += 1
-        if detections.shape[0] == 0:
-            online_targets = self.tracker.update(np.empty((0, 5)), img_shape, img_shape)
-        else:
-            online_targets = self.tracker.update(detections, img_shape, img_shape)
-        return online_targets
+        d = dets if dets.shape[0] > 0 else np.empty((0, 5))
+        return self.tracker.update(d, img_shape, img_shape)
 
-# ------------------------- KalmanTracker -------------------------
+
+# ------------------------------------------------------------------ #
+#  KalmanTracker — state: [X, Z, Vx, Vz] in world-space metres       #
+# ------------------------------------------------------------------ #
 class KalmanTracker:
-    """Фильтр Калмана для сглаживания траектории и оценки скорости."""
-    def __init__(self, dt=1.0, min_speed=0.1):
+    PROC_POS  = 0.002   
+    PROC_VEL  = 0.05    
+    MEAS_NOISE = 0.7   
+
+    def __init__(self):
         self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.transitionMatrix = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ], np.float32)
-        self.kf.measurementMatrix = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.001
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
-        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.processNoiseCov   = np.diag([
+            self.PROC_POS, self.PROC_POS,
+            self.PROC_VEL, self.PROC_VEL,
+        ]).astype(np.float32)
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * (self.MEAS_NOISE ** 2)
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
         self.initialized = False
-        self.last_update_time = None
-        self.dt = dt
-        self.min_speed = min_speed
+        self.last_time   = None
 
-    def update(self, measurement, timestamp):
+    def update(self, x: float, z: float, t: float):
         if not self.initialized:
-            self.kf.statePost = np.array([
-                [measurement[0]],
-                [measurement[1]],
-                [0],
-                [0]
-            ], np.float32)
-            self.initialized = True
-            self.last_update_time = timestamp
-            return measurement[0], measurement[1], 0.0
+            self.kf.statePost = np.array([[x],[z],[0.0],[0.0]], np.float32)
+            self.initialized  = True
+            self.last_time    = t
+            return x, z, 0.0, 0.0          
 
-        if self.last_update_time is not None:
-            dt_real = max(0.01, timestamp - self.last_update_time)
-            self.kf.transitionMatrix[0, 2] = dt_real
-            self.kf.transitionMatrix[1, 3] = dt_real
+        dt = max(1e-3, t - self.last_time)
+        self.last_time = t
+
+        F = np.eye(4, dtype=np.float32)
+        F[0, 2] = dt
+        F[1, 3] = dt
+        self.kf.transitionMatrix = F
+
+        qa = 0.5   
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        self.kf.processNoiseCov = np.diag([
+            0.5 * qa * dt3,   
+            0.5 * qa * dt3,   
+            qa  * dt,         
+            qa  * dt,         
+        ]).astype(np.float32)
 
         self.kf.predict()
-        measured = np.array([[measurement[0]], [measurement[1]]], np.float32)
-        self.kf.correct(measured)
+        self.kf.correct(np.array([[x],[z]], np.float32))
+        s = self.kf.statePost.flatten()
+        return float(s[0]), float(s[1]), float(s[2]), float(s[3])   
 
-        state = self.kf.statePost
-        x, z, vx, vz = state[0, 0], state[1, 0], state[2, 0], state[3, 0]
-        speed = np.sqrt(vx**2 + vz**2)
-        if speed < self.min_speed:
-            speed = 0.0
-        self.last_update_time = timestamp
-        return x, z, speed   # <-- обязательно возвращаем три значения
-    
-    
-        
 
-# ------------------------- SpeedEstimator (улучшенный) -------------------------
+# ------------------------------------------------------------------ #
+#  SpeedEstimator                                                    #
+# ------------------------------------------------------------------ #
+MAX_PIX_JUMP   = 40    
+MAX_HEIGHT_CHG = 0.40
+MIN_OBS        = 12
+ABS_MAX_SPEED  = 15.0
+WINDOW_SEC     = 5.0
+EMA_ALPHA      = 0.10
+DISPLAY_INTERVAL = 4
+
 class SpeedEstimator:
-    def __init__(self, fps=30, min_movement=0.2):
-        self.fps = fps
-        self.min_movement = min_movement
-        self.trackers = {}          # track_id -> KalmanTracker
-        self.current_speeds = {}    # track_id -> speed (m/s)
-        self.last_use_time = {}     # track_id -> timestamp (для очистки)
-        self.timeout = 10.0         # секунд без обновлений до удаления трекера
+    def __init__(self, fps=30, window_size=WINDOW_SEC,
+                 smooth_alpha=EMA_ALPHA, display_interval=DISPLAY_INTERVAL):
+        self.fps              = fps
+        self.window_size      = window_size
+        self.smooth_alpha     = smooth_alpha
+        self.display_interval = display_interval
+        self.timeout          = 10.0
 
-    def _world_coordinates(self, bbox, points_map, mask_map=None):
+        self.trackers          = {}   
+        self.history           = {}   
+        self.current_speed     = {}
+        self.display_speed     = {}
+        self.last_display_time = {}
+        self.last_time         = {}
+        self.last_pixel        = {}   
+        self.last_bbox_h       = {}   
+
+        self.points_map  = None
+        self.mask        = None
+        self.K           = None
+        self.px_scale_x  = 1.0   
+        self.px_scale_y  = 1.0
+
+    def load_depth_map(self, camera_id: str,
+                       video_w: int = 0, video_h: int = 0,
+                       apply_calibration: bool = True):
+        cfg = Path('cfg') / camera_id
+        self.points_map = np.load(cfg / 'points_map.npy')   
+        self.mask       = np.load(cfg / 'mask.npy')
+        with open(cfg / 'meta.json') as f:
+            meta = json.load(f)
+
+        dm_h, dm_w = self.points_map.shape[:2]
+        src_w = float(video_w  if video_w  > 0 else meta.get('original_width',  dm_w))
+        src_h = float(video_h  if video_h  > 0 else meta.get('original_height', dm_h))
+
+        self.px_scale_x = dm_w / src_w   
+        self.px_scale_y = dm_h / src_h
+
+        meta_w = float(meta.get('original_width',  0))
+        meta_h = float(meta.get('original_height', 0))
+        if meta_w > 0 and meta_h > 0 and (meta_w != src_w or meta_h != src_h):
+            print(f"[SpeedEstimator] WARNING: empty_frame was {int(meta_w)}×{int(meta_h)} "
+                  f"but video is {int(src_w)}×{int(src_h)}. "
+                  f"Depth map may not match the scene geometry!")
+
+        K_path = cfg / 'intrinsics.npy'
+        if K_path.exists():
+            self.K = np.load(K_path)
+        else:
+            fl = max(dm_h, dm_w) * 1.2
+            self.K = np.array([[fl, 0, dm_w/2],
+                                [0, fl, dm_h/2],
+                                [0,  0,      1]], dtype=np.float32)
+
+        self._apply_depth_calibration(cfg, apply_calibration)
+        print(f"[SpeedEstimator] depth map {dm_w}×{dm_h}, "
+              f"video {int(src_w)}×{int(src_h)}, "
+              f"scale x={self.px_scale_x:.4f} y={self.px_scale_y:.4f}")
+
+    def _apply_depth_calibration(self, cfg_dir, apply):
+        if not apply:
+            return
+        cal_file = cfg_dir / 'calibration.json'
+        if not cal_file.exists():
+            return
+        try:
+            with open(cal_file) as f:
+                calib = json.load(f)
+            if calib.get('type') == 'polynomial':
+                poly = np.poly1d(calib['coefficients'])
+                print(f"[SpeedEstimator] Applying calibration: {poly}")
+                Z = self.points_map[..., 2]
+                K = poly(Z)
+                self.points_map = self.points_map * K[..., np.newaxis]
+        except Exception as e:
+            print(f"[SpeedEstimator] Calibration error: {e}")
+
+    def _sample_point(self, cx_orig: float, cy_orig: float):
+        h, w = self.points_map.shape[:2]
+        cx = cx_orig * self.px_scale_x
+        cy = cy_orig * self.px_scale_y
+        cx_i = int(round(np.clip(cx, 0, w - 1)))
+        cy_i = int(round(np.clip(cy, 0, h - 1)))
+
+        if self.mask[cy_i, cx_i]:
+            pt = self.points_map[cy_i, cx_i]
+            return float(pt[0]), float(pt[2])
+
+        LAT_VID = 8
+        VRT_VID = 5
+        lat = max(1, int(round(LAT_VID * self.px_scale_x)))
+        vrt = max(1, int(round(VRT_VID * self.px_scale_y)))
+
+        for dy in range(0, vrt + 1):
+            for dx in range(0, lat + 1):
+                for sx, sy in ([(0,0),(dx,0),(-dx,0),(0,-dy),(dx,-dy),(-dx,-dy)]
+                                if dy > 0 else [(0,0),(dx,0),(-dx,0)]):
+                    nx, ny = cx_i + sx, cy_i + sy
+                    if 0 <= nx < w and 0 <= ny < h and self.mask[ny, nx]:
+                        pt = self.points_map[ny, nx]
+                        return float(pt[0]), float(pt[2])
+
+        pt = self.points_map[cy_i, cx_i]
+        return float(pt[0]), float(pt[2])
+
+    def update(self, track_id: int, bbox, t: float) -> float:
         x1, y1, x2, y2 = bbox
-        h, w = points_map.shape[:2]
-        cx = int((x1 + x2) / 2)
-        cy = int(y2)
-        cx = max(0, min(cx, w - 1))
-        cy = max(0, min(cy, h - 1))
-
-        if mask_map is not None and not mask_map[cy, cx]:
-            for dy in range(-5, 6):
-                for dx in range(-5, 6):
-                    ny, nx = cy + dy, cx + dx
-                    if 0 <= ny < h and 0 <= nx < w and mask_map[ny, nx]:
-                        cx, cy = nx, ny
-                        break
-                else:
-                    continue
-                break
-
-        point = points_map[cy, cx]
-        return point[0], point[1], point[2]  # x, y, z
-
-    def update(self, track_id, bbox, points_map, mask_map, frame_id, timestamp=None):
-        if timestamp is None:
-            timestamp = frame_id / self.fps
-
-        world_pos = self._world_coordinates(bbox, points_map, mask_map)
-        x_raw, y_raw, z_raw = world_pos
+        cx_px  = (x1 + x2) / 2.0
+        cy_px = float(y2) - 0.07 * (y2 - y1)         
+        bbox_h = float(y2 - y1)
 
         if track_id not in self.trackers:
-            self.trackers[track_id] = KalmanTracker(dt=1.0/self.fps, min_speed=self.min_movement)
+            self.trackers[track_id]          = KalmanTracker()
+            raw_x, raw_z = self._sample_point(cx_px, cy_px)
+            self.trackers[track_id].update(raw_x, raw_z, t)
+            self.history[track_id]           = deque()
+            self.history[track_id].append((t, raw_x, raw_z))
+            self.current_speed[track_id]     = 0.0
+            self.display_speed[track_id]     = 0.0
+            self.last_display_time[track_id] = t - self.display_interval
+            self.last_time[track_id]         = t
+            self.last_pixel[track_id]        = (cx_px, cy_px)
+            self.last_bbox_h[track_id]       = bbox_h
+            self._cleanup(t)
+            return 0.0
 
-        tracker = self.trackers[track_id]
-        x_f, z_f, speed = tracker.update([x_raw, z_raw], timestamp)
+        last_cx, last_cy = self.last_pixel[track_id]
+        pix_jump = np.sqrt((cx_px - last_cx)**2 + (cy_px - last_cy)**2)
+        bbox_w    = float(x2 - x1)
+        jump_thresh = max(30.0, bbox_w * 0.5)   
+        if pix_jump > jump_thresh:
+            self.last_time[track_id] = t
+            self.last_pixel[track_id] = (cx_px, cy_px)
+            self.last_bbox_h[track_id] = bbox_h
+            self._cleanup(t)
+            return self.display_speed[track_id]
 
-        self.current_speeds[track_id] = speed
-        self.last_use_time[track_id] = timestamp
+        prev_h = self.last_bbox_h[track_id]
+        if prev_h > 0 and abs(bbox_h - prev_h) / prev_h > MAX_HEIGHT_CHG:
+            self.last_time[track_id] = t
+            self.last_pixel[track_id] = (cx_px, cy_px)
+            self.last_bbox_h[track_id] = bbox_h
+            self._cleanup(t)
+            return self.display_speed[track_id]
 
-        self._cleanup(timestamp)
-        return speed
+        self.last_pixel[track_id]    = (cx_px, cy_px)
+        self.last_bbox_h[track_id]   = bbox_h
 
-    def get_speed(self, track_id):
-        return self.current_speeds.get(track_id, 0.0)
+        raw_x, raw_z = self._sample_point(cx_px, cy_px)
+        sx, sz, vx, vz = self.trackers[track_id].update(raw_x, raw_z, t)
 
-    def _cleanup(self, current_time):
-        to_delete = [tid for tid, t in self.last_use_time.items() if current_time - t > self.timeout]
-        for tid in to_delete:
-            del self.trackers[tid]
-            del self.current_speeds[tid]
-            del self.last_use_time[tid]
+        self.history[track_id].append((t, sx, sz))
+        while self.history[track_id] and \
+              t - self.history[track_id][0][0] > self.window_size:
+            self.history[track_id].popleft()
 
-# ------------------------- Отрисовка -------------------------
-def draw_bbox_with_speed(img, bbox, speed=None, color=(0, 255, 0), thickness=2):
+        hist = list(self.history[track_id])
+        if len(hist) < MIN_OBS:
+            self.last_time[track_id] = t
+            self._cleanup(t)
+            return self.display_speed[track_id]
+
+        raw_speeds = []
+        for i in range(1, len(hist)):
+            dt_i  = hist[i][0] - hist[i-1][0]
+            if dt_i <= 0: continue
+            dx = hist[i][1] - hist[i-1][1]
+            dz = hist[i][2] - hist[i-1][2]
+            sp = np.sqrt(dx*dx + dz*dz) / dt_i
+            if sp < ABS_MAX_SPEED:
+                raw_speeds.append(sp)
+
+        if not raw_speeds:
+            self.last_time[track_id] = t
+            self._cleanup(t)
+            return self.display_speed[track_id]
+
+        speeds_arr = np.array(raw_speeds)
+        q1, q3 = np.percentile(speeds_arr, [25, 75])
+        iqr = q3 - q1
+        fence = q3 + 1.5 * iqr
+        clean = speeds_arr[speeds_arr <= fence]
+        median_speed = float(np.median(clean)) if len(clean) > 0 else float(np.median(speeds_arr))
+
+        prev = self.current_speed[track_id]
+        self.current_speed[track_id] = prev + self.smooth_alpha * (median_speed - prev)
+
+        if t - self.last_display_time[track_id] >= self.display_interval:
+            kmh = self.current_speed[track_id] * 3.6
+            kmh_rounded = round(kmh * 2) / 2.0
+            self.display_speed[track_id] = kmh_rounded / 3.6
+            self.last_display_time[track_id] = t
+
+        self.last_time[track_id] = t
+        self._cleanup(t)
+        return self.display_speed[track_id]
+
+    def _cleanup(self, now):
+        dead = [tid for tid, last in self.last_time.items() if now - last > self.timeout]
+        for tid in dead:
+            self.trackers.pop(tid, None)
+            self.current_speed.pop(tid, None)
+            self.display_speed.pop(tid, None)
+            self.last_display_time.pop(tid, None)
+            self.history.pop(tid, None)
+            self.last_time.pop(tid, None)
+            self.last_pixel.pop(tid, None)
+            self.last_bbox_h.pop(tid, None)
+
+
+# ------------------------------------------------------------------ #
+#  Drawing (only bbox + speed, no bird eye)                          #
+# ------------------------------------------------------------------ #
+def _speed_color(kmh):
+    ratio = min(kmh / 15.0, 1.0)
+    return (0, int(255*(1-ratio)), int(255*ratio))
+
+def draw_bbox(img, bbox, track_id, speed_mps):
     x1, y1, x2, y2 = map(int, bbox)
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-    if speed is not None:
-        speed_kmh = speed * 3.6
-        label = f"{speed_kmh:.1f} km/h"
-        (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(img, (x1, y1 - text_h - 8), (x1 + text_w + 4, y1 - 2), color, -1)
-        cv2.putText(img, label, (x1 + 2, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    kmh   = speed_mps * 3.6
+    color = _speed_color(kmh)
+    cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
+    label = f"ID:{track_id}  {kmh:.1f} km/h"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    cv2.rectangle(img, (x1, y2+2), (x1+tw+4, y2+th+10), color, -1)
+    cv2.putText(img, label, (x1+2, y2+th+6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2)
 
-# ------------------------- main -------------------------
+
+# ------------------------------------------------------------------ #
+#  Argument parsing                                                    #
+# ------------------------------------------------------------------ #
 def parse_args():
-    parser = argparse.ArgumentParser(description="Speed Estimation Pipeline with MoGe")
-    parser.add_argument("--input", type=str, required=True, help="Path to input video or RTSP URL")
-    parser.add_argument("--output", type=str, default="output.avi", help="Path to output video")
-    parser.add_argument("--det_model", type=str, default="yolov8s_576x1024_v3.onnx", help="YOLOv8 ONNX model path")
-    parser.add_argument("--conf", type=float, default=0.3, help="Detection confidence threshold")
-    parser.add_argument("--moge_interval", type=float, default=1.0, help="MoGe inference interval (seconds)")
-    parser.add_argument("--device", type=str, default="cuda", help="Device for MoGe and YOLO (cuda/cpu)")
-    parser.add_argument("--min_movement", type=float, default=0.2, help="Minimum movement in meters to consider non-zero speed")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description='Offline speed-estimation with ByteTrack + YOLO')
+    p.add_argument('--empty_frame', required=True)
+    p.add_argument('--video',       required=True)
+    p.add_argument('--camera_id',   required=True)
+    p.add_argument('--det_model',   default='yolov8n_best.onnx')
+    p.add_argument('--conf',        type=float, default=0.1)
+    p.add_argument('--device',      default='cuda')
+    p.add_argument('--output',      default='video_with_bbox_and_speed.mp4')
+    p.add_argument('--clahe',       type=float, default=0.0)
+    p.add_argument('--denoise',     type=float, default=0.0)
+    p.add_argument('--sharpen',     type=float, default=0.0)
+    p.add_argument('--run_depth',   action='store_true',
+                   help='Run depth_estimator.py before processing')
+    p.add_argument('--no_calibrate', action='store_true')
+    p.add_argument('--max_pix_jump',   type=float, default=MAX_PIX_JUMP,
+                   help='Max bottom-centre pixel jump before frame is skipped')
+    p.add_argument('--window_sec',     type=float, default=WINDOW_SEC,
+                   help='Sliding window length in seconds')
+    p.add_argument('--ema_alpha',      type=float, default=EMA_ALPHA,
+                   help='EMA smoothing factor for display speed')
+    return p.parse_args()
 
+
+# ------------------------------------------------------------------ #
+#  Main                                                                #
+# ------------------------------------------------------------------ #
 def main():
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    cap = cv2.VideoCapture(args.input)
+    global MAX_PIX_JUMP, WINDOW_SEC, EMA_ALPHA
+    MAX_PIX_JUMP = args.max_pix_jump
+    WINDOW_SEC   = args.window_sec
+    EMA_ALPHA    = args.ema_alpha
+
+    cfg_dir = Path('cfg') / args.camera_id
+    if args.run_depth:
+        run_depth_estimator(
+            args.empty_frame, args.camera_id, args.device,
+            clahe=args.clahe, denoise=args.denoise, sharpen=args.sharpen,
+        )
+    elif not (cfg_dir / 'points_map.npy').exists():
+        print(f"[ERROR] Depth map not found at {cfg_dir}. "
+              f"Run depth_estimator.py first, or pass --run_depth.")
+        sys.exit(1)
+
+    cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
-        print("Error: Cannot open video source.")
-        return
+        print(f"[ERROR] Cannot open video: {args.video}")
+        sys.exit(1)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[video] {width}×{height} @ {fps:.2f} fps — {total} frames")
 
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+    if not writer.isOpened():
+        print(f"[ERROR] Cannot open VideoWriter for: {args.output}")
+        sys.exit(1)
 
-    detector = YOLOv8Detector(args.det_model, conf_thres=args.conf, input_size=(1024, 576))
-    tracker = ByteTracker(frame_rate=fps)
-    speed_estimator = SpeedEstimator(fps=fps, min_movement=args.min_movement)
+    cuda_ok = 'CUDAExecutionProvider' in ort.get_available_providers()
+    device  = args.device if (args.device == 'cuda' and cuda_ok) else 'cpu'
+    if args.device == 'cuda' and not cuda_ok:
+        print("[WARNING] CUDA not available — using CPU")
 
-    print("Loading MoGe model...")
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
-    moge_model.eval()
-    print("MoGe loaded.")
+    detector  = YOLOv8Detector(args.det_model, conf_thres=args.conf, device=device)
+    tracker   = ByteTracker(frame_rate=fps)
+    speed_est = SpeedEstimator(
+        fps=fps,
+        window_size=args.window_sec,
+        smooth_alpha=args.ema_alpha,
+        display_interval=DISPLAY_INTERVAL,
+    )
+    speed_est.load_depth_map(args.camera_id, video_w=width, video_h=height,
+                             apply_calibration=not args.no_calibrate)
 
     frame_id = 0
-    moge_interval_frames = int(fps * args.moge_interval)
-    last_moge_frame = -moge_interval_frames
-    points = None
-    mask = None
+    t0       = time.time()
 
-    print("Processing...")
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frame_id += 1
 
-        detections = detector.detect(frame)
-        online_targets = tracker.update(detections, (height, width))
+        frame_id  += 1
+        video_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        # Вызов MoGe с заданным интервалом
-        if frame_id - last_moge_frame >= moge_interval_frames:
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            input_tensor = torch.tensor(img_rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
-            with torch.no_grad():
-                output = moge_model.infer(input_tensor)
-            points = output["points"].cpu().numpy()
-            mask = output["mask"].cpu().numpy()
-            last_moge_frame = frame_id
+        frame   = apply_filters(frame, args.clahe, args.denoise, args.sharpen)
+        dets    = detector.detect(frame)
+        targets = tracker.update(dets, (height, width))
 
-        # Обновление скорости и отрисовка (только если есть данные MoGe)
-        if points is not None:
-            for t in online_targets:
-                tlwh = t.tlwh
-                x1, y1, w, h = tlwh
-                x2, y2 = x1 + w, y1 + h
-                bbox = (x1, y1, x2, y2)
-                track_id = t.track_id
+        for t in targets:
+            bbox = t.tlwh.copy()
+            bbox[2] += bbox[0]
+            bbox[3] += bbox[1]
+            speed = speed_est.update(t.track_id, bbox, video_time)
+            draw_bbox(frame, bbox, t.track_id, speed)
 
-                speed = speed_estimator.update(track_id, bbox, points, mask, frame_id)
-                draw_bbox_with_speed(frame, bbox, speed)
+        writer.write(frame)
 
-        out.write(frame)
-
-        if frame_id % 100 == 0:
-            print(f"Processed {frame_id} frames")
+        if frame_id % 50 == 0 or frame_id == 1:
+            elapsed  = time.time() - t0
+            pct      = (frame_id / total * 100) if total > 0 else 0
+            spd_fps  = frame_id / elapsed if elapsed > 0 else 0
+            eta      = (total - frame_id) / spd_fps if spd_fps > 0 and total > 0 else 0
+            print(f"  {frame_id}/{total}  ({pct:.1f}%)  "
+                  f"{spd_fps:.1f} fps  ETA {eta:.0f}s", end='\r')
 
     cap.release()
-    out.release()
-    print(f"Done. Output saved to {args.output}")
+    writer.release()
+    print(f"\n[done] Saved → {args.output}")
 
-if __name__ == "__main__":
+
+if __name__  == '__main__':
     main()
