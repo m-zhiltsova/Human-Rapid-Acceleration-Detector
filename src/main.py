@@ -57,6 +57,7 @@ class YOLOv8Detector:
     NMS_THRESHOLD = 0.45
     MODEL_INPUT_SHAPE = (704, 1280)
 
+
     def __init__(self, model_path, conf_thres=0.1, device='cuda'):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
         self.session = ort.InferenceSession(model_path, providers=providers)
@@ -435,7 +436,7 @@ class SpeedEstimator:
 
 
 # ------------------------------------------------------------------ #
-#  Drawing (only bbox + speed, no bird eye)                          #
+#  Drawing                                                            #
 # ------------------------------------------------------------------ #
 def _speed_color(kmh):
     ratio = min(kmh / 15.0, 1.0)
@@ -452,6 +453,65 @@ def draw_bbox(img, bbox, track_id, speed_mps):
     cv2.putText(img, label, (x1+2, y2+th+6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2)
 
+def draw_topdown_panel(active_data, panel_w=320, panel_h=720, 
+                       max_depth_z=40.0, min_x=-20.0, max_x=20.0):
+    """
+    Рисует 2D вид сверху.
+    - max_depth_z: Максимальная глубина в метрах (от камеры вдаль)
+    - min_x, max_x: Ширина захвата камеры в метрах (лево / право)
+    """
+    # Темный фон панели
+    panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+    panel[:] = (18, 18, 28)
+
+    # Заголовок
+    cv2.putText(panel, "2D TOP-DOWN VIEW", (12, 36),
+                cv2.FONT_HERSHEY_DUPLEX, 0.65, (200, 200, 255), 1, cv2.LINE_AA)
+
+    # Координаты камеры на 2D-полотне (обычно снизу по центру)
+    cam_x_px = int((0 - min_x) / (max_x - min_x) * panel_w)
+    cam_y_px = panel_h
+
+    # Рисуем сетку расстояний (полукруги каждые 5 метров)
+    for dist in range(5, int(max_depth_z) + 1, 5):
+        r_px = int((dist / max_depth_z) * panel_h)
+        cv2.circle(panel, (cam_x_px, cam_y_px), r_px, (40, 40, 55), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{dist}m", (cam_x_px + 5, cam_y_px - r_px - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 100), 1, cv2.LINE_AA)
+
+    # Рисуем людей и их "хвосты"
+    for tid, data in active_data.items():
+        history = data['history']
+        speed = data['speed']
+        kmh = speed * 3.6
+        color = _speed_color(kmh)
+
+        pts = []
+        for t_val, x, z in history:
+            # Преобразуем (X, Z) метры в (X, Y) пиксели на панели
+            px = int((x - min_x) / (max_x - min_x) * panel_w)
+            py = int(panel_h - (z / max_depth_z) * panel_h)
+            pts.append((px, py))
+
+        # Рисуем след (trail)
+        if len(pts) > 1:
+            pts_arr = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(panel, [pts_arr], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+        # Рисуем текущую точку и ID
+        if pts:
+            curr_x, curr_y = pts[-1]
+            cv2.circle(panel, (curr_x, curr_y), 5, color, -1, cv2.LINE_AA)
+            cv2.putText(panel, f"ID:{tid}", (curr_x + 8, curr_y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 255), 1, cv2.LINE_AA)
+
+    return panel
+
+def compose_frame(cam_frame, active_data, out_w, out_h, panel_w=320):
+    cam_resized = cv2.resize(cam_frame, (out_w, out_h))
+    panel       = draw_topdown_panel(active_data, panel_w=panel_w, panel_h=out_h)
+    return np.hstack([cam_resized, panel])
+
 
 # ------------------------------------------------------------------ #
 #  Argument parsing                                                    #
@@ -465,6 +525,9 @@ def parse_args():
     p.add_argument('--conf',        type=float, default=0.1)
     p.add_argument('--device',      default='cuda')
     p.add_argument('--output',      default='video_with_bbox_and_speed.mp4')
+    p.add_argument('--out_width',   type=int, default=1280)
+    p.add_argument('--out_height',  type=int, default=720)
+    p.add_argument('--panel_width', type=int, default=320)
     p.add_argument('--clahe',       type=float, default=0.0)
     p.add_argument('--denoise',     type=float, default=0.0)
     p.add_argument('--sharpen',     type=float, default=0.0)
@@ -513,8 +576,9 @@ def main():
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"[video] {width}×{height} @ {fps:.2f} fps — {total} frames")
 
+    out_total_w = args.out_width + args.panel_width
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+    writer = cv2.VideoWriter(args.output, fourcc, fps, (out_total_w, args.out_height))
     if not writer.isOpened():
         print(f"[ERROR] Cannot open VideoWriter for: {args.output}")
         sys.exit(1)
@@ -550,14 +614,26 @@ def main():
         dets    = detector.detect(frame)
         targets = tracker.update(dets, (height, width))
 
+        # Собираем данные (скорость и историю координат) для отрисовки 2D-карты
+        active_data = {}
         for t in targets:
             bbox = t.tlwh.copy()
             bbox[2] += bbox[0]
             bbox[3] += bbox[1]
             speed = speed_est.update(t.track_id, bbox, video_time)
+            
+            # Получаем историю точек: это очередь из кортежей (time, x, z)
+            hist = list(speed_est.history.get(t.track_id, []))
+            
+            active_data[t.track_id] = {
+                'speed': speed,
+                'history': hist
+            }
             draw_bbox(frame, bbox, t.track_id, speed)
 
-        writer.write(frame)
+        composed = compose_frame(frame, active_data,
+                                 args.out_width, args.out_height, args.panel_width)
+        writer.write(composed)
 
         if frame_id % 50 == 0 or frame_id == 1:
             elapsed  = time.time() - t0
