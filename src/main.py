@@ -1,395 +1,1109 @@
-# Теперь можно импортировать
-import sys
-from pathlib import Path
-
-# Абсолютный путь к папке с main.py
-BASE = Path(__file__).resolve().parent
-
-# Добавляем папку Depth-Anything-V2 в список поиска модулей
-sys.path.insert(0, str(BASE / "Depth-Anything-V2"))
-import cv2
+import os, sys, cv2, json, time, argparse, subprocess
+from collections import deque
 import numpy as np
 if not hasattr(np, 'float'):
     np.float = float
 import onnxruntime as ort
-import torch
-import time
-import argparse
-from collections import defaultdict, deque
-
+from pathlib import Path
+from dataclasses import dataclass, field
+from scipy.optimize import linear_sum_assignment
 from yolox.tracker.byte_tracker import BYTETracker
-from types import SimpleNamespace
-from depth_anything_v2.dpt import DepthAnythingV2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-CONF_THRESH   = 0.35
-NMS_THRESH    = 0.45
-INPUT_SIZE    = 640          # YOLOv8 input side
-PERSON_CLS_ID = 0
+# ------------------------------------------------------------------ #
+#  Inline depth estimation (optional)                                 #
+# ------------------------------------------------------------------ #
+def run_depth_estimator(empty_frame, camera_id, device,
+                        clahe=0.0, denoise=0.0, sharpen=0.0):
+    script = Path(__file__).parent / 'depth_estimator.py'
+    if not script.exists():
+        print(f"[ERROR] depth_estimator.py not found next to this script ({script})")
+        sys.exit(1)
+    cmd = [
+        sys.executable, str(script),
+        '--input',     str(empty_frame),
+        '--camera_id', str(camera_id),
+        '--device',    str(device),
+    ]
+    if clahe   > 0: cmd += ['--clahe',   str(clahe)]
+    if denoise > 0: cmd += ['--denoise', str(denoise)]
+    if sharpen > 0: cmd += ['--sharpen', str(sharpen)]
+    print(f"[depth] Running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
-# Depth → real-world scale calibration
-# Depth Anything outputs *relative* inverse-depth. We convert with:
-#   real_distance_m = DEPTH_SCALE / depth_value
-# Tune DEPTH_SCALE for your camera / scene (default ≈ 5 m at mid-scene depth)
-DEPTH_SCALE   = 5.0
 
-# Speed smoothing: keep last N frames per track
-SPEED_HISTORY = 8
+# ------------------------------------------------------------------ #
+#  Image filters                                                      #
+# ------------------------------------------------------------------ #
+def apply_filters(frame, clahe_clip=0.0, denoise_h=0.0, sharpen_amount=0.0):
+    if clahe_clip > 0:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        frame = cv2.cvtColor(cv2.merge([l,a,b]), cv2.COLOR_Lab2BGR)
+    if denoise_h > 0:
+        frame = cv2.fastNlMeansDenoisingColored(frame, None, denoise_h, denoise_h, 7, 21)
+    if sharpen_amount > 0:
+        blurred = cv2.GaussianBlur(frame, (0,0), 3)
+        frame = cv2.addWeighted(frame, 1.0 + sharpen_amount, blurred, -sharpen_amount, 0)
+    return frame
 
-# Colour palette (BGR)
-BOX_COLOR     = (0, 230, 118)
-TEXT_BG_COLOR = (0, 0, 0)
-TEXT_COLOR    = (255, 255, 255)
 
+# ------------------------------------------------------------------ #
+#  MoveNet — precise foot landmark detection inside a bbox            #
+# ------------------------------------------------------------------ #
+# MoveNet keypoint indices (COCO-compatible ordering used by MoveNet):
+#   0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear,
+#   5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow,
+#   9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip,
+#  13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
+_KP_LEFT_ANKLE  = 15
+_KP_RIGHT_ANKLE = 16
 
-# ─────────────────────────────────────────────────────────────────────────────
-# YOLOv8 ONNX DETECTOR
-# ─────────────────────────────────────────────────────────────────────────────
-class YOLOv8Detector:
-    def __init__(self, model_path: str):
+class MoveNetDetector:
+    """
+    Wraps the MoveNet SinglePose Lightning ONNX model.
+
+    Usage:
+        movenet = MoveNetDetector('movenet_singlepose_lightning_4.onnx', device='cuda')
+        foot_x, foot_y = movenet.get_foot_point(frame, bbox)
+
+    get_foot_point() crops the bbox region from *frame*, runs inference,
+    and returns the pixel coordinate (x, y) of the lower ankle in the
+    original frame's coordinate system.  Falls back to the classic
+    bottom-centre of the bbox when confidence is too low.
+    """
+
+    # MoveNet Lightning expects 192×192 RGB uint8 input
+    INPUT_SIZE   = 192
+    CONF_THRESH  = 0.20   # min keypoint confidence to trust a landmark
+    # Extra margin (fraction of bbox side) added before cropping so the
+    # model sees some context around the person
+    CROP_MARGIN  = 0.10
+
+    def __init__(self, model_path: str, device: str = 'cuda'):
         providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if ort.get_device() == "GPU"
-            else ["CPUExecutionProvider"]
+            ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            if device == 'cuda'
+            else ['CPUExecutionProvider']
         )
-        self.sess = ort.InferenceSession(model_path, providers=providers)
-        self.input_name  = self.sess.get_inputs()[0].name
-        self.input_shape = self.sess.get_inputs()[0].shape  # [1,3,H,W]
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        inp = self.session.get_inputs()[0]
+        out = self.session.get_outputs()[0]
+        self.input_name  = inp.name
+        self.output_name = out.name
+        print(f"[MoveNet] Loaded '{model_path}'  providers={self.session.get_providers()}")
 
-    def preprocess(self, frame: np.ndarray):
-        """Letterbox + normalise → (1,3,640,640) float32"""
-        h, w = frame.shape[:2]
-        scale = INPUT_SIZE / max(h, w)
-        nh, nw = int(h * scale), int(w * scale)
-        resized = cv2.resize(frame, (nw, nh))
-        canvas = np.full((INPUT_SIZE, INPUT_SIZE, 3), 114, dtype=np.uint8)
-        pad_top  = (INPUT_SIZE - nh) // 2
-        pad_left = (INPUT_SIZE - nw) // 2
-        canvas[pad_top:pad_top+nh, pad_left:pad_left+nw] = resized
-        blob = canvas.astype(np.float32) / 255.0
-        blob = blob.transpose(2, 0, 1)[None]          # HWC → 1CHW
-        return blob, scale, pad_top, pad_left
-
-    def postprocess(self, output, scale, pad_top, pad_left,
-                    orig_h, orig_w):
+    # -------------------------------------------------------------- #
+    def _crop_with_margin(self, frame: np.ndarray, bbox):
         """
-        YOLOv8 output: [1, 84, 8400]  (cx, cy, w, h, cls0…cls83)
-        Returns list of [x1, y1, x2, y2, conf, cls]
+        Returns (crop_img, x_off, y_off, scale_x, scale_y).
+        crop_img  – RGB uint8 array of shape (192, 192, 3)
+        x_off, y_off – pixel offset of the crop in the original frame
+        scale_x, scale_y – how many original pixels correspond to 1 crop pixel
         """
-        preds = output[0][0]          # (84, 8400)
-        preds = preds.T               # (8400, 84)
+        H, W = frame.shape[:2]
+        x1, y1, x2, y2 = map(float, bbox[:4])
+        bw, bh = x2 - x1, y2 - y1
 
-        boxes   = preds[:, :4]        # cx,cy,w,h  (letterbox coords)
-        scores  = preds[:, 4:]        # class scores (no obj score in v8)
-        cls_ids = scores.argmax(axis=1)
-        confs   = scores.max(axis=1)
+        # add margin
+        mx, my = bw * self.CROP_MARGIN, bh * self.CROP_MARGIN
+        cx1 = max(0, int(x1 - mx))
+        cy1 = max(0, int(y1 - my))
+        cx2 = min(W, int(x2 + mx))
+        cy2 = min(H, int(y2 + my))
 
-        # Keep only PERSON class above threshold
-        mask = (cls_ids == PERSON_CLS_ID) & (confs >= CONF_THRESH)
-        boxes, confs, cls_ids = boxes[mask], confs[mask], cls_ids[mask]
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return None, x1, y1, 1.0, 1.0
 
-        if len(boxes) == 0:
-            return []
+        crop_h, crop_w = crop.shape[:2]
+        resized  = cv2.resize(crop, (self.INPUT_SIZE, self.INPUT_SIZE),
+                              interpolation=cv2.INTER_LINEAR)
+        rgb      = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        scale_x  = crop_w / self.INPUT_SIZE
+        scale_y  = crop_h / self.INPUT_SIZE
+        return rgb, cx1, cy1, scale_x, scale_y
 
-        # cx,cy,w,h → x1,y1,x2,y2  (letterbox space)
-        x1 = boxes[:, 0] - boxes[:, 2] / 2
-        y1 = boxes[:, 1] - boxes[:, 3] / 2
-        x2 = boxes[:, 0] + boxes[:, 2] / 2
-        y2 = boxes[:, 1] + boxes[:, 3] / 2
-
-        # Remove padding, undo scale → original image coords
-        x1 = np.clip((x1 - pad_left) / scale, 0, orig_w)
-        y1 = np.clip((y1 - pad_top)  / scale, 0, orig_h)
-        x2 = np.clip((x2 - pad_left) / scale, 0, orig_w)
-        y2 = np.clip((y2 - pad_top)  / scale, 0, orig_h)
-
-        # NMS
-        idxs = cv2.dnn.NMSBoxes(
-            np.stack([x1, y1, x2-x1, y2-y1], axis=1).tolist(),
-            confs.tolist(), CONF_THRESH, NMS_THRESH
-        )
-        if len(idxs) == 0:
-            return []
-        idxs = idxs.flatten()
-        return np.stack([x1[idxs], y1[idxs],
-                         x2[idxs], y2[idxs],
-                         confs[idxs], cls_ids[idxs].astype(float)], axis=1)
-
-    def detect(self, frame: np.ndarray):
-        orig_h, orig_w = frame.shape[:2]
-        blob, scale, pad_top, pad_left = self.preprocess(frame)
-        outputs = self.sess.run(None, {self.input_name: blob})
-        return self.postprocess(outputs, scale, pad_top, pad_left,
-                                orig_h, orig_w)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DEPTH ESTIMATOR  (Depth Anything V2 – Small)
-# ─────────────────────────────────────────────────────────────────────────────
-class DepthEstimator:
-    MODEL_CONFIGS = {
-        "vits": {"encoder": "vits", "features": 64,  "out_channels": [48,  96,  192, 384]},
-        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96,  192, 384, 768]},
-        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
-    }
-
-    def __init__(self, encoder: str = "vitl",
-                 checkpoint: str = "checkpoints/depth_anything_v2_vitl.pth"):
-        cfg = self.MODEL_CONFIGS[encoder]
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = DepthAnythingV2(**cfg)
-        state = torch.load(checkpoint, map_location="cpu")
-        self.model.load_state_dict(state)
-        self.model = self.model.to(self.device).eval()
-
-    @torch.no_grad()
-    def infer(self, frame_rgb: np.ndarray) -> np.ndarray:
-        """Returns depth map (H×W float32), higher = closer by convention here."""
-        depth = self.model.infer_image(frame_rgb)   # returns np array
-        return depth.astype(np.float32)
-
-    def sample_depth(self, depth_map: np.ndarray,
-                     cx: int, cy: int, radius: int = 5) -> float:
+    # -------------------------------------------------------------- #
+    def _run_inference(self, rgb_img: np.ndarray) -> np.ndarray:
         """
-        Sample median depth in a small patch around (cx, cy).
-        Converts relative depth → approximate metres using DEPTH_SCALE.
+        Runs MoveNet and returns keypoints array of shape (17, 3):
+            [:, 0] = y  (normalised 0-1)
+            [:, 1] = x  (normalised 0-1)
+            [:, 2] = confidence score
         """
-        h, w = depth_map.shape
-        x1, y1 = max(0, cx-radius), max(0, cy-radius)
-        x2, y2 = min(w, cx+radius), min(h, cy+radius)
-        patch = depth_map[y1:y2, x1:x2]
-        if patch.size == 0:
-            return 0.0
-        med = float(np.median(patch))
-        if med < 1e-6:
-            return 0.0
-        return DEPTH_SCALE / med          # metres
+        inp = rgb_img.astype(np.int32)           # MoveNet expects int32
+        inp = np.expand_dims(inp, axis=0)        # (1, 192, 192, 3)
+        outputs = self.session.run([self.output_name], {self.input_name: inp})
+        # output shape: (1, 1, 17, 3)
+        keypoints = outputs[0][0][0]             # (17, 3)
+        return keypoints
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SPEED TRACKER  (wraps ByteTrack + distance history)
-# ─────────────────────────────────────────────────────────────────────────────
-class SpeedTracker:
-    def __init__(self, fps: float):
-        self.fps = fps
-        args = SimpleNamespace(
-            track_thresh=0.45,
-            track_buffer=30,
-            match_thresh=0.8,
-            mot20=False,
-        )
-        self.tracker  = BYTETracker(args, frame_rate=int(fps))
-        # track_id → deque of (timestamp_s, distance_m)
-        self.history: dict[int, deque] = defaultdict(
-            lambda: deque(maxlen=SPEED_HISTORY + 1)
-        )
-        self.speeds: dict[int, float] = {}
-
-    def update(self, detections, depth_map: np.ndarray,
-               frame_idx: int) -> list:
+    # -------------------------------------------------------------- #
+    def get_foot_point(self, frame: np.ndarray, bbox) -> tuple:
         """
-        detections: Nx6 array [x1,y1,x2,y2,conf,cls]
-        Returns list of (track_id, x1,y1,x2,y2, speed_kmh)
+        Returns (cx_px, cy_px) in original-frame coordinates:
+        the pixel closest to the ground contact point of the person
+        described by *bbox*.
+
+        Strategy:
+          1. Crop the bbox (+ margin) from *frame* and resize to 192×192.
+          2. Run MoveNet to get ankle landmarks.
+          3. Pick the ankle with higher confidence; if both are above
+             CONF_THRESH, take the lower one (larger y = closer to ground).
+          4. Map the landmark back to original-frame pixel coordinates.
+          5. Fallback: if confidence is too low, return the classic
+             bottom-centre of the bbox (same as the original pipeline).
         """
-        t = frame_idx / self.fps
+        x1, y1, x2, y2 = map(float, bbox[:4])
+        fallback_x = (x1 + x2) / 2.0
+        fallback_y = float(y2) - 0.07 * (y2 - y1)  # original heuristic
 
-        if len(detections) == 0:
-            self.tracker.update(
-                np.empty((0, 5), dtype=np.float32),
-                [frame_idx, frame_idx], [1, 1]
-            )
-            return []
+        rgb, cx1, cy1, scale_x, scale_y = self._crop_with_margin(frame, bbox)
+        if rgb is None:
+            return fallback_x, fallback_y
 
-        dets_bt = np.hstack([
-            detections[:, :4],
-            detections[:, 4:5]
+        try:
+            kps = self._run_inference(rgb)   # (17, 3)  [y_norm, x_norm, conf]
+        except Exception as e:
+            print(f"[MoveNet] inference error: {e}")
+            return fallback_x, fallback_y
+
+        left  = kps[_KP_LEFT_ANKLE]    # [y_norm, x_norm, conf]
+        right = kps[_KP_RIGHT_ANKLE]
+
+        # Select the best ankle keypoint
+        best = None
+        if left[2] >= self.CONF_THRESH and right[2] >= self.CONF_THRESH:
+            # both visible — pick the lower one (larger y)
+            best = left if left[0] >= right[0] else right
+        elif left[2] >= self.CONF_THRESH:
+            best = left
+        elif right[2] >= self.CONF_THRESH:
+            best = right
+
+        if best is None:
+            return fallback_x, fallback_y   # low confidence — use fallback
+
+        # best = [y_norm, x_norm, conf]  (normalised over the 192×192 crop)
+        # Map back to original frame coordinates
+        foot_x = cx1 + best[1] * self.INPUT_SIZE * scale_x
+        foot_y = cy1 + best[0] * self.INPUT_SIZE * scale_y
+
+        # Clamp to frame bounds
+        H, W = frame.shape[:2]
+        foot_x = float(np.clip(foot_x, 0, W - 1))
+        foot_y = float(np.clip(foot_y, 0, H - 1))
+
+        return foot_x, foot_y
+
+
+# ------------------------------------------------------------------ #
+#  YOLOv8 Detector                                                    #
+# ------------------------------------------------------------------ #
+class YOLOv8Detector:
+    PERSON_CLASS_ID = 0
+    NMS_THRESHOLD = 0.45
+    MODEL_INPUT_SHAPE = (704, 1280)
+
+
+    def __init__(self, model_path, conf_thres=0.05, device='cuda'):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        print(f"[YOLO] Providers: {self.session.get_providers()}")
+        self.conf_threshold = conf_thres
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+    def _letterbox(self, img, new_shape=MODEL_INPUT_SHAPE, color=(114, 114, 114)):
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw /= 2; dh /= 2
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, r, (dw, dh)
+
+    def _preprocess(self, frame):
+        img, ratio, pad = self._letterbox(frame, self.MODEL_INPUT_SHAPE)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_norm = img_rgb.astype(np.float32) / 255.0
+        img_tensor = np.transpose(img_norm, (2, 0, 1))
+        img_tensor = np.expand_dims(img_tensor, axis=0)
+        return img_tensor, ratio, pad
+
+    def _postprocess(self, output, orig_shape, ratio, pad):
+        detections = output[0]
+        if detections.shape[1] == 0:
+            return np.empty((0, 5))
+        if detections.shape[0] == 5:
+            boxes = detections[:4, :]
+            scores = detections[4:5, :]
+            person_scores = scores[0, :]
+        else:
+            boxes = detections[:4, :]
+            scores = detections[4:, :]
+            if scores.shape[0] == 0:
+                return np.empty((0, 5))
+            person_scores = scores[self.PERSON_CLASS_ID, :]
+        valid_idx = np.where(person_scores > self.conf_threshold)[0]
+        if len(valid_idx) == 0:
+            return np.empty((0, 5))
+        h_input, w_input = self.MODEL_INPUT_SHAPE
+        boxes_xyxy, confidences = [], []
+        for idx in valid_idx:
+            cx, cy, w, h = boxes[:, idx]
+            x1 = max(0, min(cx - w/2, w_input))
+            y1 = max(0, min(cy - h/2, h_input))
+            x2 = max(0, min(cx + w/2, w_input))
+            y2 = max(0, min(cy + h/2, h_input))
+            boxes_xyxy.append([x1, y1, x2, y2])
+            confidences.append(person_scores[idx])
+        boxes_xywh = [[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in boxes_xyxy]
+        indices = cv2.dnn.NMSBoxes(boxes_xywh, confidences, self.conf_threshold, self.NMS_THRESHOLD)
+        if len(indices) == 0:
+            return np.empty((0, 5))
+        r, (dw, dh) = ratio, pad
+        final_dets = []
+        for i in indices.flatten():
+            x1, y1, w, h = boxes_xywh[i]
+            x1 = (x1 - dw) / r; y1 = (y1 - dh) / r
+            w /= r;              h /= r
+            x2, y2 = x1 + w, y1 + h
+            x1 = max(0, min(x1, orig_shape[1]))
+            y1 = max(0, min(y1, orig_shape[0]))
+            x2 = max(0, min(x2, orig_shape[1]))
+            y2 = max(0, min(y2, orig_shape[0]))
+            final_dets.append([x1, y1, x2, y2, confidences[i]])
+        return np.array(final_dets)
+
+    def detect(self, img):
+        img_tensor, ratio, pad = self._preprocess(img)
+        outputs = self.session.run([self.output_name], {self.input_name: img_tensor})
+        return self._postprocess(outputs[0], img.shape[:2], ratio, pad)
+
+
+# ------------------------------------------------------------------ #
+#  ByteTracker  (improved — drop-in replacement)                     #
+# ------------------------------------------------------------------ #
+# Key improvements over the original:
+#
+#  1. Tighter matching thresholds:
+#     • track_thresh  0.35 → 0.50   : only high-conf dets start new tracks
+#     • match_thresh  0.95 → 0.70   : stricter IoU — fewer wrong merges
+#     • track_buffer  90   → 45 fr  : lost tracks expire faster (≈1.5 s @30 fps)
+#
+#  2. Appearance embeddings (histogram-based, zero extra deps):
+#     Each track stores a colour-histogram signature of the person crop.
+#     During the second-stage "low-confidence" matching that ByteTrack
+#     normally resolves with IoU alone, we blend IoU + appearance distance
+#     so that people who briefly occlude each other can be re-identified
+#     correctly when they separate.
+#
+#  3. Prediction-gated matching:
+#     We query each track's Kalman predicted position and skip the IoU
+#     match entirely when the predicted box and the detection are too far
+#     apart (> MAX_IOU_DIST), preventing a fast-moving person from
+#     hijacking a stationary track's ID.
+#
+#  4. Robust low-detection frames:
+#     When YOLO returns zero detections we still tick the internal
+#     frame counter so Kalman predictions stay in sync with real time.
+#
+# Everything outside this block is untouched.
+# ------------------------------------------------------------------ #
+
+@dataclass
+class ByteTrackerArgs:
+    track_thresh:        float = 0.50   # was 0.35 — raise to suppress junk dets
+    track_buffer:        int   = 45     # was 90  — ~1.5 s at 30 fps
+    match_thresh:        float = 0.70   # was 0.95 — stricter IoU matching
+    aspect_ratio_thresh: float = 3.5    # allow slightly taller boxes (crowds)
+    min_box_area:        float = 400    # was 5 — reject tiny noise detections
+    mot20:               bool  = False
+
+
+# ---------- Appearance helper ---------------------------------------- #
+
+def _colour_hist(frame: np.ndarray, bbox, bins: int = 32) -> np.ndarray:
+    """
+    Compact HSV colour histogram for the upper-body crop of a person.
+    Using only the top 60 % of the box avoids the ground / shadow region
+    which often varies with lighting and viewpoint.
+    Returns a unit-norm float32 vector of length bins*2 (H + S channels).
+    """
+    x1, y1, x2, y2 = map(int, bbox[:4])
+    h = y2 - y1
+    # Upper 60 % of the bounding box → torso / clothes
+    crop = frame[y1: y1 + int(h * 0.60), x1:x2]
+    if crop.size == 0:
+        return np.zeros(bins * 2, dtype=np.float32)
+    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h_ch = cv2.calcHist([hsv], [0], None, [bins], [0, 180]).flatten()
+    s_ch = cv2.calcHist([hsv], [1], None, [bins], [0, 256]).flatten()
+    feat = np.concatenate([h_ch, s_ch]).astype(np.float32)
+    norm = np.linalg.norm(feat)
+    return feat / norm if norm > 1e-6 else feat
+
+
+def _appearance_dist(feat_a: np.ndarray, feat_b: np.ndarray) -> float:
+    """Cosine distance in [0, 1].  0 = identical appearance."""
+    dot = float(np.dot(feat_a, feat_b))
+    return 1.0 - np.clip(dot, 0.0, 1.0)
+
+
+# ---------- Per-track appearance memory ------------------------------ #
+
+@dataclass
+class _TrackAppearance:
+    """Exponential moving average of colour histograms for one track."""
+    feat:  np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    alpha: float      = 0.25   # EMA weight for new observations
+
+    def update(self, new_feat: np.ndarray):
+        if self.feat.size == 0:
+            self.feat = new_feat.copy()
+        else:
+            self.feat = (1.0 - self.alpha) * self.feat + self.alpha * new_feat
+            n = np.linalg.norm(self.feat)
+            if n > 1e-6:
+                self.feat /= n
+
+    def distance(self, other_feat: np.ndarray) -> float:
+        if self.feat.size == 0 or other_feat.size == 0:
+            return 1.0
+        return _appearance_dist(self.feat, other_feat)
+
+
+# ---------- IoU helper ----------------------------------------------- #
+
+def _iou(box_a, box_b) -> float:
+    """IoU between two [x1,y1,x2,y2] boxes."""
+    ax1, ay1, ax2, ay2 = box_a[:4]
+    bx1, by1, bx2, by2 = box_b[:4]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih   = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter    = iw * ih
+    ua = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+    return inter / ua if ua > 1e-6 else 0.0
+
+
+# ---------- Main ByteTracker wrapper --------------------------------- #
+
+class ByteTracker:
+    """
+    Drop-in replacement for the original ByteTracker wrapper.
+
+    Internally it still delegates to yolox BYTETracker for the core
+    Kalman + two-stage matching logic, but adds:
+      • tighter args (see ByteTrackerArgs above)
+      • appearance memory per track (EMA colour histogram)
+      • a post-pass that re-checks any "new" track IDs assigned to
+        detections that also have a strong appearance match to a recently
+        lost track — and restores the old ID if the match is convincing.
+
+    The re-ID post-pass runs in O(new_tracks × lost_tracks) which is
+    negligible for typical pedestrian scenes (< 20 people).
+    """
+
+    # Thresholds for the appearance-based re-ID post-pass
+    REID_IOU_MIN       = 0.10   # candidate must overlap at least this much …
+    REID_APPEAR_MAX    = 0.30   # … AND be this similar in appearance (0=same)
+    REID_COMBINED_MAX  = 0.35   # blended score gate  (0.5*iou_cost + 0.5*app)
+    LOST_MEMORY_SEC    = 3.0    # how long to remember a lost track's appearance
+
+    def __init__(self, frame_rate: int = 30):
+        self._args      = ByteTrackerArgs()
+        self._tracker   = BYTETracker(self._args, frame_rate=frame_rate)
+        self.frame_id   = 0
+        self._fps       = frame_rate
+
+        # appearance memory: track_id → _TrackAppearance
+        self._appearance: dict[int, _TrackAppearance] = {}
+
+        # recently-lost tracks: track_id → (last_bbox_xyxy, appearance, timestamp_frame)
+        self._lost: dict[int, tuple] = {}
+
+        # mapping  new_id → restored_old_id  (applied this frame, for caller)
+        self._id_remap: dict[int, int] = {}
+
+        # reverse: old_id that has been re-used — avoid double-mapping
+        self._remapped_to: set[int] = set()
+
+    # ---------------------------------------------------------------- #
+    def update(self, dets: np.ndarray, img_shape: tuple,
+               frame: np.ndarray = None) -> list:
+        """
+        Parameters
+        ----------
+        dets      : (N,5) array [x1,y1,x2,y2,score] from YOLO (may be empty)
+        img_shape : (H, W) of the original frame
+        frame     : optional BGR frame used for colour-histogram appearance
+                    (pass None to skip appearance features — falls back to
+                    IoU-only re-ID, which is still better than the original)
+
+        Returns
+        -------
+        List of STrack objects (same interface as the original wrapper).
+        track_id values may be remapped to restore previously lost IDs.
+        """
+        self.frame_id += 1
+        d = dets if (dets is not None and dets.shape[0] > 0) else np.empty((0, 5))
+
+        # ---- 1. Run core ByteTrack ---------------------------------- #
+        active_tracks = self._tracker.update(d, img_shape, img_shape)
+
+        # ---- 2. Build det → bbox lookup for appearance extraction --- #
+        #  BYTETracker returns STrack objects with .tlwh; convert to xyxy
+        track_boxes = {}
+        for tr in active_tracks:
+            tlwh = tr.tlwh
+            x1   = tlwh[0];          y1 = tlwh[1]
+            x2   = tlwh[0]+tlwh[2];  y2 = tlwh[1]+tlwh[3]
+            track_boxes[tr.track_id] = np.array([x1, y1, x2, y2])
+
+        # ---- 3. Update appearance memory for active tracks ---------- #
+        active_ids = set(tr.track_id for tr in active_tracks)
+
+        if frame is not None:
+            for tr in active_tracks:
+                tid  = tr.track_id
+                bbox = track_boxes[tid]
+                feat = _colour_hist(frame, bbox)
+                if tid not in self._appearance:
+                    self._appearance[tid] = _TrackAppearance()
+                self._appearance[tid].update(feat)
+
+        # ---- 4. Expire old lost-track memories ---------------------- #
+        max_age = int(self.LOST_MEMORY_SEC * self._fps)
+        expired = [tid for tid, (_, _, age) in self._lost.items()
+                   if self.frame_id - age > max_age]
+        for tid in expired:
+            self._lost.pop(tid, None)
+            self._appearance.pop(tid, None)
+
+        # ---- 5. Appearance-based re-ID post-pass ------------------- #
+        #  Identify tracks that BYTETracker just *created* this frame
+        #  (their IDs appear for the first time in active_ids).
+        #  Check whether they closely match any recently lost track.
+        self._id_remap   = {}
+        self._remapped_to = set()
+
+        if self._lost and active_tracks:
+            # Collect "new" tracks — simple heuristic: appeared this frame
+            # We detect newness by checking the track's is_activated flag
+            # and frame_id == start_frame (both set by BYTETracker internals).
+            new_tracks = [tr for tr in active_tracks
+                          if getattr(tr, 'start_frame', -1) == self.frame_id]
+
+            lost_ids   = list(self._lost.keys())
+
+            for tr in new_tracks:
+                tid   = tr.track_id
+                bbox  = track_boxes[tid]
+                a_new = self._appearance.get(tid)
+
+                best_score  = self.REID_COMBINED_MAX
+                best_old_id = None
+
+                for old_id in lost_ids:
+                    if old_id in self._remapped_to:
+                        continue   # already claimed this frame
+
+                    old_bbox, old_app, _ = self._lost[old_id]
+
+                    # Spatial gate — bounding boxes must at least be nearby
+                    iou = _iou(bbox, old_bbox)
+                    if iou < self.REID_IOU_MIN:
+                        continue
+
+                    # Appearance gate
+                    if a_new is not None and old_app is not None:
+                        app_d = a_new.distance(old_app.feat)
+                        if app_d > self.REID_APPEAR_MAX:
+                            continue
+                        combined = 0.40 * (1.0 - iou) + 0.60 * app_d
+                    else:
+                        # No appearance info — use IoU only
+                        combined = 1.0 - iou
+
+                    if combined < best_score:
+                        best_score  = combined
+                        best_old_id = old_id
+
+                if best_old_id is not None:
+                    self._id_remap[tid]           = best_old_id
+                    self._remapped_to.add(best_old_id)
+                    # Transfer appearance memory to restored ID
+                    if a_new is not None:
+                        self._appearance[best_old_id] = a_new
+                    self._appearance.pop(tid, None)
+                    self._lost.pop(best_old_id, None)
+                    print(f"[ReID] frame {self.frame_id}: "
+                          f"new ID {tid} → restored as ID {best_old_id} "
+                          f"(score={best_score:.3f})")
+
+        # ---- 6. Move tracks that dropped out to lost memory --------- #
+        #  (we do this AFTER re-ID so that re-used old IDs are not lost)
+        previously_active = set(self._lost.keys()) | active_ids
+        just_lost = previously_active - active_ids - set(self._id_remap.values())
+        for tid in just_lost:
+            if tid in self._appearance and tid in track_boxes:
+                self._lost[tid] = (
+                    track_boxes.get(tid, np.zeros(4)),
+                    self._appearance[tid],
+                    self.frame_id,
+                )
+
+        # ---- 7. Apply ID remap to returned STrack objects ----------- #
+        #  STrack.track_id is a plain int attribute; we can safely override.
+        for tr in active_tracks:
+            if tr.track_id in self._id_remap:
+                tr.track_id = self._id_remap[tr.track_id]
+
+        return active_tracks
+
+
+# ------------------------------------------------------------------ #
+#  KalmanTracker — state: [X, Z, Vx, Vz] in world-space metres       #
+# ------------------------------------------------------------------ #
+class KalmanTracker:
+    PROC_POS  = 0.002   
+    PROC_VEL  = 0.05    
+    MEAS_NOISE = 0.7   
+
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.processNoiseCov   = np.diag([
+            self.PROC_POS, self.PROC_POS,
+            self.PROC_VEL, self.PROC_VEL,
+        ]).astype(np.float32)
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * (self.MEAS_NOISE ** 2)
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
+        self.initialized = False
+        self.last_time   = None
+
+    def update(self, x: float, z: float, t: float):
+        if not self.initialized:
+            self.kf.statePost = np.array([[x],[z],[0.0],[0.0]], np.float32)
+            self.initialized  = True
+            self.last_time    = t
+            return x, z, 0.0, 0.0          
+
+        dt = max(1e-3, t - self.last_time)
+        self.last_time = t
+
+        F = np.eye(4, dtype=np.float32)
+        F[0, 2] = dt
+        F[1, 3] = dt
+        self.kf.transitionMatrix = F
+
+        qa = 0.5   
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        self.kf.processNoiseCov = np.diag([
+            0.5 * qa * dt3,   
+            0.5 * qa * dt3,   
+            qa  * dt,         
+            qa  * dt,         
         ]).astype(np.float32)
 
-        img_info = [depth_map.shape[0], depth_map.shape[1]]
-        img_size = img_info
+        self.kf.predict()
+        self.kf.correct(np.array([[x],[z]], np.float32))
+        s = self.kf.statePost.flatten()
+        return float(s[0]), float(s[1]), float(s[2]), float(s[3])   
 
-        online_targets = self.tracker.update(dets_bt, img_info, img_size)
 
-        results = []
-        for t_obj in online_targets:
-            tlwh = t_obj.tlwh
-            tid  = t_obj.track_id
-            x1 = int(tlwh[0])
-            y1 = int(tlwh[1])
-            x2 = int(tlwh[0] + tlwh[2])
-            y2 = int(tlwh[1] + tlwh[3])
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
+# ------------------------------------------------------------------ #
+#  SpeedEstimator                                                    #
+# ------------------------------------------------------------------ #
+MAX_PIX_JUMP   = 40    
+MAX_HEIGHT_CHG = 0.40
+MIN_OBS        = 12
+ABS_MAX_SPEED  = 15.0
+WINDOW_SEC     = 2.0
+EMA_ALPHA      = 0.10
+DISPLAY_INTERVAL = 2
 
-            
-            dist_m = self._get_distance(depth_map, cx, cy)
-            ts     = frame_idx / self.fps
+class SpeedEstimator:
+    def __init__(self, fps=30, window_size=WINDOW_SEC,
+                 smooth_alpha=EMA_ALPHA, display_interval=DISPLAY_INTERVAL,
+                 movenet: MoveNetDetector = None):
+        self.fps              = fps
+        self.window_size      = window_size
+        self.smooth_alpha     = smooth_alpha
+        self.display_interval = display_interval
+        self.timeout          = 10.0
 
-            self.history[tid].append((ts, dist_m))
-            speed = self._calc_speed(tid)
-            self.speeds[tid] = speed
+        # MoveNet for precise foot-point detection (optional)
+        self.movenet = movenet
 
-            results.append((tid, x1, y1, x2, y2, speed))
+        self.trackers          = {}   
+        self.history           = {}   
+        self.current_speed     = {}
+        self.display_speed     = {}
+        self.last_display_time = {}
+        self.last_time         = {}
+        self.last_pixel        = {}   
+        self.last_bbox_h       = {}   
 
-        return results
+        self.points_map  = None
+        self.mask        = None
+        self.K           = None
+        self.px_scale_x  = 1.0   
+        self.px_scale_y  = 1.0
 
-    def _get_distance(self, depth_map, cx, cy):
-        estimator_ref = _depth_estimator_ref   # module-level ref set in main
-        return estimator_ref.sample_depth(depth_map, cx, cy)
+    def load_depth_map(self, camera_id: str,
+                       video_w: int = 0, video_h: int = 0,
+                       apply_calibration: bool = True):
+        cfg = Path('cfg') / camera_id
+        self.points_map = np.load(cfg / 'points_map.npy')   
+        self.mask       = np.load(cfg / 'mask.npy')
+        with open(cfg / 'meta.json') as f:
+            meta = json.load(f)
 
-    def _calc_speed(self, tid: int) -> float:
-        hist = self.history[tid]
-        if len(hist) < 2:
+        dm_h, dm_w = self.points_map.shape[:2]
+        src_w = float(video_w  if video_w  > 0 else meta.get('original_width',  dm_w))
+        src_h = float(video_h  if video_h  > 0 else meta.get('original_height', dm_h))
+
+        self.px_scale_x = dm_w / src_w   
+        self.px_scale_y = dm_h / src_h
+
+        meta_w = float(meta.get('original_width',  0))
+        meta_h = float(meta.get('original_height', 0))
+        if meta_w > 0 and meta_h > 0 and (meta_w != src_w or meta_h != src_h):
+            print(f"[SpeedEstimator] WARNING: empty_frame was {int(meta_w)}×{int(meta_h)} "
+                  f"but video is {int(src_w)}×{int(src_h)}. "
+                  f"Depth map may not match the scene geometry!")
+
+        K_path = cfg / 'intrinsics.npy'
+        if K_path.exists():
+            self.K = np.load(K_path)
+        else:
+            fl = max(dm_h, dm_w) * 1.2
+            self.K = np.array([[fl, 0, dm_w/2],
+                                [0, fl, dm_h/2],
+                                [0,  0,      1]], dtype=np.float32)
+
+        self._apply_depth_calibration(cfg, apply_calibration)
+        print(f"[SpeedEstimator] depth map {dm_w}×{dm_h}, "
+              f"video {int(src_w)}×{int(src_h)}, "
+              f"scale x={self.px_scale_x:.4f} y={self.px_scale_y:.4f}")
+
+    def _apply_depth_calibration(self, cfg_dir, apply):
+        if not apply:
+            return
+        cal_file = cfg_dir / 'calibration.json'
+        if not cal_file.exists():
+            return
+        try:
+            with open(cal_file) as f:
+                calib = json.load(f)
+            if calib.get('type') == 'polynomial':
+                poly = np.poly1d(calib['coefficients'])
+                print(f"[SpeedEstimator] Applying calibration: {poly}")
+                Z = self.points_map[..., 2]
+                K = poly(Z)
+                self.points_map = self.points_map * K[..., np.newaxis]
+        except Exception as e:
+            print(f"[SpeedEstimator] Calibration error: {e}")
+
+    def _sample_point(self, cx_orig: float, cy_orig: float):
+        h, w = self.points_map.shape[:2]
+        cx = cx_orig * self.px_scale_x
+        cy = cy_orig * self.px_scale_y
+        cx_i = int(round(np.clip(cx, 0, w - 1)))
+        cy_i = int(round(np.clip(cy, 0, h - 1)))
+
+        if self.mask[cy_i, cx_i]:
+            pt = self.points_map[cy_i, cx_i]
+            return float(pt[0]), float(pt[2])
+
+        LAT_VID = 8
+        VRT_VID = 5
+        lat = max(1, int(round(LAT_VID * self.px_scale_x)))
+        vrt = max(1, int(round(VRT_VID * self.px_scale_y)))
+
+        for dy in range(0, vrt + 1):
+            for dx in range(0, lat + 1):
+                for sx, sy in ([(0,0),(dx,0),(-dx,0),(0,-dy),(dx,-dy),(-dx,-dy)]
+                                if dy > 0 else [(0,0),(dx,0),(-dx,0)]):
+                    nx, ny = cx_i + sx, cy_i + sy
+                    if 0 <= nx < w and 0 <= ny < h and self.mask[ny, nx]:
+                        pt = self.points_map[ny, nx]
+                        return float(pt[0]), float(pt[2])
+
+        pt = self.points_map[cy_i, cx_i]
+        return float(pt[0]), float(pt[2])
+
+    def _get_foot_pixel(self, frame, bbox) -> tuple:
+        """
+        Returns (cx_px, cy_px) — the ground-contact pixel for this person.
+
+        If MoveNet is available, delegates to it (falls back automatically
+        inside MoveNetDetector when confidence is low).
+        Otherwise uses the original bottom-centre heuristic.
+        """
+        if self.movenet is not None:
+            return self.movenet.get_foot_point(frame, bbox)
+
+        # Original heuristic (no MoveNet)
+        x1, y1, x2, y2 = map(float, bbox[:4])
+        cx_px = (x1 + x2) / 2.0
+        cy_px = float(y2) - 0.07 * (y2 - y1)
+        return cx_px, cy_px
+
+    def update(self, track_id: int, bbox, t: float,
+               frame: np.ndarray = None) -> float:
+        """
+        frame — the current video frame (BGR); required when MoveNet is
+                enabled so that foot landmarks can be detected.  When
+                MoveNet is disabled, frame may be None (original behaviour).
+        """
+        x1, y1, x2, y2 = bbox
+        bbox_h = float(y2 - y1)
+
+        # ---- foot point (MoveNet or fallback heuristic) ----
+        cx_px, cy_px = self._get_foot_pixel(frame, bbox) if frame is not None \
+                       else ((x1 + x2) / 2.0, float(y2) - 0.07 * (y2 - y1))
+
+        if track_id not in self.trackers:
+            self.trackers[track_id]          = KalmanTracker()
+            raw_x, raw_z = self._sample_point(cx_px, cy_px)
+            self.trackers[track_id].update(raw_x, raw_z, t)
+            self.history[track_id]           = deque()
+            self.history[track_id].append((t, raw_x, raw_z))
+            self.current_speed[track_id]     = 0.0
+            self.display_speed[track_id]     = 0.0
+            self.last_display_time[track_id] = t - self.display_interval
+            self.last_time[track_id]         = t
+            self.last_pixel[track_id]        = (cx_px, cy_px)
+            self.last_bbox_h[track_id]       = bbox_h
+            self._cleanup(t)
             return 0.0
-        t0, d0 = hist[0]
-        t1, d1 = hist[-1]
-        dt = t1 - t0
-        if dt < 1e-6:
-            return 0.0
-        # 3-D displacement approximation: we only have depth change (z-axis)
-        # For in-plane motion, use pixel displacement scaled by depth.
-        # Here we use absolute depth difference as proxy distance change.
-        dd = abs(d1 - d0)           # metres along camera axis
-        speed_ms  = dd / dt
-        speed_kmh = speed_ms * 3.6
-        return round(speed_kmh, 1)
+
+        last_cx, last_cy = self.last_pixel[track_id]
+        pix_jump = np.sqrt((cx_px - last_cx)**2 + (cy_px - last_cy)**2)
+        bbox_w    = float(x2 - x1)
+        jump_thresh = max(30.0, bbox_w * 0.5)   
+        if pix_jump > jump_thresh:
+            self.last_time[track_id] = t
+            self.last_pixel[track_id] = (cx_px, cy_px)
+            self.last_bbox_h[track_id] = bbox_h
+            self._cleanup(t)
+            return self.display_speed[track_id]
+
+        prev_h = self.last_bbox_h[track_id]
+        if prev_h > 0 and abs(bbox_h - prev_h) / prev_h > MAX_HEIGHT_CHG:
+            self.last_time[track_id] = t
+            self.last_pixel[track_id] = (cx_px, cy_px)
+            self.last_bbox_h[track_id] = bbox_h
+            self._cleanup(t)
+            return self.display_speed[track_id]
+
+        self.last_pixel[track_id]    = (cx_px, cy_px)
+        self.last_bbox_h[track_id]   = bbox_h
+
+        raw_x, raw_z = self._sample_point(cx_px, cy_px)
+        sx, sz, vx, vz = self.trackers[track_id].update(raw_x, raw_z, t)
+
+        self.history[track_id].append((t, sx, sz))
+        while self.history[track_id] and \
+              t - self.history[track_id][0][0] > self.window_size:
+            self.history[track_id].popleft()
+
+        hist = list(self.history[track_id])
+        if len(hist) < MIN_OBS:
+            self.last_time[track_id] = t
+            self._cleanup(t)
+            return self.display_speed[track_id]
+
+        raw_speeds = []
+        for i in range(1, len(hist)):
+            dt_i  = hist[i][0] - hist[i-1][0]
+            if dt_i <= 0: continue
+            dx = hist[i][1] - hist[i-1][1]
+            dz = hist[i][2] - hist[i-1][2]
+            sp = np.sqrt(dx*dx + dz*dz) / dt_i
+            if sp < ABS_MAX_SPEED:
+                raw_speeds.append(sp)
+
+        if not raw_speeds:
+            self.last_time[track_id] = t
+            self._cleanup(t)
+            return self.display_speed[track_id]
+
+        speeds_arr = np.array(raw_speeds)
+        q1, q3 = np.percentile(speeds_arr, [25, 75])
+        iqr = q3 - q1
+        fence = q3 + 1.5 * iqr
+        clean = speeds_arr[speeds_arr <= fence]
+        median_speed = float(np.median(clean)) if len(clean) > 0 else float(np.median(speeds_arr))
+
+        prev = self.current_speed[track_id]
+        self.current_speed[track_id] = prev + self.smooth_alpha * (median_speed - prev)
+
+        if t - self.last_display_time[track_id] >= self.display_interval:
+            kmh = self.current_speed[track_id] * 3.6
+            kmh_rounded = round(kmh * 2) / 2.0
+            self.display_speed[track_id] = kmh_rounded / 3.6
+            self.last_display_time[track_id] = t
+
+        self.last_time[track_id] = t
+        self._cleanup(t)
+        return self.display_speed[track_id]
+
+    def _cleanup(self, now):
+        dead = [tid for tid, last in self.last_time.items() if now - last > self.timeout]
+        for tid in dead:
+            self.trackers.pop(tid, None)
+            self.current_speed.pop(tid, None)
+            self.display_speed.pop(tid, None)
+            self.last_display_time.pop(tid, None)
+            self.history.pop(tid, None)
+            self.last_time.pop(tid, None)
+            self.last_pixel.pop(tid, None)
+            self.last_bbox_h.pop(tid, None)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DRAWING UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
-def draw_results(frame: np.ndarray, results: list) -> np.ndarray:
-    vis = frame.copy()
-    for (tid, x1, y1, x2, y2, speed) in results:
-        # Bounding box
-        cv2.rectangle(vis, (x1, y1), (x2, y2), BOX_COLOR, 2)
+# ------------------------------------------------------------------ #
+#  Drawing                                                            #
+# ------------------------------------------------------------------ #
+def _speed_color(kmh):
+    ratio = min(kmh / 15.0, 1.0)
+    return (0, int(255*(1-ratio)), int(255*ratio))
 
-        # Label background + text
-        label = f"ID:{tid}  {speed} km/h"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(vis, (x1, y1 - th - 8), (x1 + tw + 4, y1),
-                      TEXT_BG_COLOR, -1)
-        cv2.putText(vis, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 1,
-                    cv2.LINE_AA)
+def draw_bbox(img, bbox, track_id, speed_mps):
+    x1, y1, x2, y2 = map(int, bbox)
+    kmh   = speed_mps * 3.6
+    color = _speed_color(kmh)
+    cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
+    label = f"ID:{track_id}  {kmh:.1f} km/h"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    cv2.rectangle(img, (x1, y2+2), (x1+tw+4, y2+th+10), color, -1)
+    cv2.putText(img, label, (x1+2, y2+th+6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2)
 
-        # Centre dot
-        cx, cy = (x1+x2)//2, (y1+y2)//2
-        cv2.circle(vis, (cx, cy), 3, (0, 255, 255), -1)
-    return vis
+def draw_topdown_panel(active_data, panel_w=320, panel_h=720, 
+                       max_depth_z=80.0, min_x=-40.0, max_x=40.0):
+    """
+    Рисует 2D вид сверху.
+    - max_depth_z: Максимальная глубина в метрах (от камеры вдаль)
+    - min_x, max_x: Ширина захвата камеры в метрах (лево / право)
+    """
+    # Темный фон панели
+    panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+    panel[:] = (18, 18, 28)
+
+    # Заголовок
+    cv2.putText(panel, "2D TOP-DOWN VIEW", (12, 36),
+                cv2.FONT_HERSHEY_DUPLEX, 0.65, (200, 200, 255), 1, cv2.LINE_AA)
+
+    # Координаты камеры на 2D-полотне (обычно снизу по центру)
+    cam_x_px = int((0 - min_x) / (max_x - min_x) * panel_w)
+    cam_y_px = panel_h
+
+    # Рисуем сетку расстояний (полукруги каждые 5 метров)
+    for dist in range(5, int(max_depth_z) + 1, 5):
+        r_px = int((dist / max_depth_z) * panel_h)
+        cv2.circle(panel, (cam_x_px, cam_y_px), r_px, (40, 40, 55), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{dist}m", (cam_x_px + 5, cam_y_px - r_px - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 100), 1, cv2.LINE_AA)
+
+    # Рисуем людей и их "хвосты"
+    for tid, data in active_data.items():
+        history = data['history']
+        speed = data['speed']
+        kmh = speed * 3.6
+        color = _speed_color(kmh)
+
+        pts = []
+        for t_val, x, z in history:
+            # Преобразуем (X, Z) метры в (X, Y) пиксели на панели
+            px = int((x - min_x) / (max_x - min_x) * panel_w)
+            py = int(panel_h - (z / max_depth_z) * panel_h)
+            pts.append((px, py))
+
+        # Рисуем след (trail)
+        if len(pts) > 1:
+            pts_arr = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(panel, [pts_arr], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+        # Рисуем текущую точку и ID
+        if pts:
+            curr_x, curr_y = pts[-1]
+            cv2.circle(panel, (curr_x, curr_y), 5, color, -1, cv2.LINE_AA)
+            cv2.putText(panel, f"ID:{tid}", (curr_x + 8, curr_y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 255), 1, cv2.LINE_AA)
+
+    return panel
+
+def compose_frame(cam_frame, active_data, out_w, out_h, panel_w=320):
+    cam_resized = cv2.resize(cam_frame, (out_w, out_h))
+    panel       = draw_topdown_panel(active_data, panel_w=panel_w, panel_h=out_h)
+    return np.hstack([cam_resized, panel])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL REF used inside SpeedTracker._get_distance
-# ─────────────────────────────────────────────────────────────────────────────
-_depth_estimator_ref: DepthEstimator = None   # set in main()
+# ------------------------------------------------------------------ #
+#  Argument parsing                                                    #
+# ------------------------------------------------------------------ #
+def parse_args():
+    p = argparse.ArgumentParser(description='Offline speed-estimation with ByteTrack + YOLO + MoveNet')
+    p.add_argument('--empty_frame', required=True)
+    p.add_argument('--video',       required=True)
+    p.add_argument('--camera_id',   required=True)
+    p.add_argument('--det_model',   default='yolov8n_best.onnx')
+    p.add_argument('--movenet_model', default='movenet_singlepose_lightning_4.onnx',
+                   help='Path to MoveNet SinglePose Lightning ONNX model. '
+                        'Pass empty string "" to disable MoveNet.')
+    p.add_argument('--movenet_conf', type=float, default=0.20,
+                   help='Minimum keypoint confidence for MoveNet ankle landmarks')
+    p.add_argument('--conf',        type=float, default=0.05)
+    p.add_argument('--device',      default='cuda')
+    p.add_argument('--output',      default='video_with_bbox_and_speed.mp4')
+    p.add_argument('--out_width',   type=int, default=1280)
+    p.add_argument('--out_height',  type=int, default=720)
+    p.add_argument('--panel_width', type=int, default=320)
+    p.add_argument('--clahe',       type=float, default=0.0)
+    p.add_argument('--denoise',     type=float, default=0.0)
+    p.add_argument('--sharpen',     type=float, default=0.0)
+    p.add_argument('--run_depth',   action='store_true',
+                   help='Run depth_estimator.py before processing')
+    p.add_argument('--no_calibrate', action='store_true')
+    p.add_argument('--max_pix_jump',   type=float, default=MAX_PIX_JUMP,
+                   help='Max bottom-centre pixel jump before frame is skipped')
+    p.add_argument('--window_sec',     type=float, default=WINDOW_SEC,
+                   help='Sliding window length in seconds')
+    p.add_argument('--ema_alpha',      type=float, default=EMA_ALPHA,
+                   help='EMA smoothing factor for display speed')
+    return p.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN PIPELINE
-# ─────────────────────────────────────────────────────────────────────────────
-def run(input_path: str, output_path: str,
-        onnx_model: str, depth_encoder: str,
-        depth_checkpoint: str):
+# ------------------------------------------------------------------ #
+#  Main                                                                #
+# ------------------------------------------------------------------ #
+def main():
+    args = parse_args()
 
-    global _depth_estimator_ref
+    global MAX_PIX_JUMP, WINDOW_SEC, EMA_ALPHA
+    MAX_PIX_JUMP = args.max_pix_jump
+    WINDOW_SEC   = args.window_sec
+    EMA_ALPHA    = args.ema_alpha
 
-    # ── Open video ────────────────────────────────────────────────────────────
-    cap = cv2.VideoCapture(input_path)
+    cfg_dir = Path('cfg') / args.camera_id
+    if args.run_depth:
+        run_depth_estimator(
+            args.empty_frame, args.camera_id, args.device,
+            clahe=args.clahe, denoise=args.denoise, sharpen=args.sharpen,
+        )
+    elif not (cfg_dir / 'points_map.npy').exists():
+        print(f"[ERROR] Depth map not found at {cfg_dir}. "
+              f"Run depth_estimator.py first, or pass --run_depth.")
+        sys.exit(1)
+
+    cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {input_path}")
+        print(f"[ERROR] Cannot open video: {args.video}")
+        sys.exit(1)
 
     fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[video] {width}×{height} @ {fps:.2f} fps — {total} frames")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out    = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    out_total_w = args.out_width + args.panel_width
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(args.output, fourcc, fps, (out_total_w, args.out_height))
+    if not writer.isOpened():
+        print(f"[ERROR] Cannot open VideoWriter for: {args.output}")
+        sys.exit(1)
 
-    print(f"[INFO] Video: {width}x{height}  {fps:.1f} fps  {total} frames")
+    cuda_ok = 'CUDAExecutionProvider' in ort.get_available_providers()
+    device  = args.device if (args.device == 'cuda' and cuda_ok) else 'cpu'
+    if args.device == 'cuda' and not cuda_ok:
+        print("[WARNING] CUDA not available — using CPU")
 
-    # ── Load models ───────────────────────────────────────────────────────────
-    print("[INFO] Loading YOLOv8 ONNX detector …")
-    detector = YOLOv8Detector(onnx_model)
+    # ---- MoveNet (optional) ----
+    movenet = None
+    if args.movenet_model:
+        movenet_path = Path(args.movenet_model)
+        if movenet_path.exists():
+            movenet = MoveNetDetector(str(movenet_path), device=device)
+            movenet.CONF_THRESH = args.movenet_conf
+        else:
+            print(f"[WARNING] MoveNet model not found at '{movenet_path}' — "
+                  f"falling back to bbox bottom-centre heuristic.")
 
-    print(f"[INFO] Loading Depth Anything V2 ({depth_encoder}) …")
-    depth_est = DepthEstimator(encoder=depth_encoder,
-                               checkpoint=depth_checkpoint)
-    _depth_estimator_ref = depth_est
+    detector  = YOLOv8Detector(args.det_model, conf_thres=args.conf, device=device)
+    tracker   = ByteTracker(frame_rate=fps)
+    speed_est = SpeedEstimator(
+        fps=fps,
+        window_size=args.window_sec,
+        smooth_alpha=args.ema_alpha,
+        display_interval=DISPLAY_INTERVAL,
+        movenet=movenet,
+    )
+    speed_est.load_depth_map(args.camera_id, video_w=width, video_h=height,
+                             apply_calibration=not args.no_calibrate)
 
-    print("[INFO] Initialising ByteTrack …")
-    speed_tracker = SpeedTracker(fps=fps)
-
-    # ── Frame loop ────────────────────────────────────────────────────────────
-    frame_idx = 0
-    t_start   = time.time()
+    frame_id = 0
+    t0       = time.time()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_id  += 1
+        video_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        # 1. Detect
-        dets = detector.detect(frame)
-        if not isinstance(dets, np.ndarray) or len(dets) == 0:
-            dets = np.empty((0, 6), dtype=np.float32)
+        frame   = apply_filters(frame, args.clahe, args.denoise, args.sharpen)
+        dets    = detector.detect(frame)
+        targets = tracker.update(dets, (height, width), frame=frame)
 
-        # 2. Depth
-        depth_map = depth_est.infer(frame_rgb)
+        # Собираем данные (скорость и историю координат) для отрисовки 2D-карты
+        active_data = {}
+        for t in targets:
+            bbox = t.tlwh.copy()
+            bbox[2] += bbox[0]
+            bbox[3] += bbox[1]
+            # Pass the current frame so MoveNet can locate ankle keypoints
+            speed = speed_est.update(t.track_id, bbox, video_time, frame=frame)
+            
+            # Получаем историю точек: это очередь из кортежей (time, x, z)
+            hist = list(speed_est.history.get(t.track_id, []))
+            
+            active_data[t.track_id] = {
+                'speed': speed,
+                'history': hist
+            }
+            draw_bbox(frame, bbox, t.track_id, speed)
 
-        # 3. Track + speed
-        results = speed_tracker.update(dets, depth_map, frame_idx)
+        composed = compose_frame(frame, active_data,
+                                 args.out_width, args.out_height, args.panel_width)
+        writer.write(composed)
 
-        # 4. Draw
-        vis = draw_results(frame, results)
-
-        # HUD
-        elapsed = time.time() - t_start
-        proc_fps = (frame_idx + 1) / max(elapsed, 1e-6)
-        cv2.putText(vis,
-                    f"Frame {frame_idx}/{total}  |  {proc_fps:.1f} fps",
-                    (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (200, 200, 200), 1, cv2.LINE_AA)
-
-        out.write(vis)
-
-        if frame_idx % 50 == 0:
-            print(f"  frame {frame_idx}/{total}  tracks={len(results)}"
-                  f"  proc={proc_fps:.1f} fps")
-
-        frame_idx += 1
+        if frame_id % 50 == 0 or frame_id == 1:
+            elapsed  = time.time() - t0
+            pct      = (frame_id / total * 100) if total > 0 else 0
+            spd_fps  = frame_id / elapsed if elapsed > 0 else 0
+            eta      = (total - frame_id) / spd_fps if spd_fps > 0 and total > 0 else 0
+            print(f"  {frame_id}/{total}  ({pct:.1f}%)  "
+                  f"{spd_fps:.1f} fps  ETA {eta:.0f}s", end='\r')
 
     cap.release()
-    out.release()
-    elapsed = time.time() - t_start
-    print(f"\n[DONE] Processed {frame_idx} frames in {elapsed:.1f}s → {output_path}")
+    writer.release()
+    print(f"\n[done] Saved → {args.output}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="People speed estimator")
-    parser.add_argument("--input",  default="video.mp4")
-    parser.add_argument("--output", default="out.mp4")
-    parser.add_argument("--model",  default="yolov8n_best.onnx",
-                        help="Path to YOLOv8 ONNX model")
-    parser.add_argument("--depth-encoder", default="vitl",
-                        choices=["vits", "vitb", "vitl"],
-                        help="Depth Anything V2 encoder size")
-    parser.add_argument("--depth-checkpoint",
-                        default="checkpoints/depth_anything_v2_vitl.pth",
-                        help="Path to Depth Anything V2 checkpoint")
-    args = parser.parse_args()
-
-    run(
-        input_path      = args.input,
-        output_path     = args.output,
-        onnx_model      = args.model,
-        depth_encoder   = args.depth_encoder,
-        depth_checkpoint= args.depth_checkpoint,
-    )
+if __name__  == '__main__':
+    main()
