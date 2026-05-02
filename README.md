@@ -104,6 +104,7 @@ yolox                # для ByteTrack (pip install yolox)
 
 ```bash
 pip install -r requirements.txt
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 ```
 
 > **GPU:** если CUDA доступна, `onnxruntime-gpu` используется автоматически. При её отсутствии код переходит на CPU без ошибок.
@@ -115,7 +116,7 @@ pip install -r requirements.txt
 ```
 speed-estimator/
 ├── src/
-│   ├── main_mp4_seg.py          ← основной пайплайн
+│   ├── main.py          ← основной пайплайн
 │   ├── depth_estimator.py       ← обёртка MoGe v2 (запускается раз на камеру)
 │   └── bytetrack/               ← исходники ByteTrack (из YOLOX)
 │
@@ -156,7 +157,7 @@ python src/depth_estimator.py \
 ### Шаг 2 — Запустить пайплайн
 
 ```bash
-python src/main_mp4_seg.py \
+python src/main.py \
     --empty_frame  путь/до/пустой_сцены.jpg \
     --video        input.mp4 \
     --camera_id    cam_001 \
@@ -168,7 +169,7 @@ python src/main_mp4_seg.py \
 Или запустить глубину и пайплайн одной командой:
 
 ```bash
-python src/main_mp4_seg.py \
+python src/main.py \
     --empty_frame empty.jpg \
     --video input.mp4 \
     --camera_id cam_001 \
