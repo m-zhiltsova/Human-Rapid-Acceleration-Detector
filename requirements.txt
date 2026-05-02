@@ -1,4 +1,34 @@
-opencv-python
-numpy
-onnxruntime
-namedtuple-maker
+# Основные библиотеки для GPU и трекинга
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+torchaudio==2.11.0+cu130
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# Специфичные пакеты для трекинга и глубины
+git+https://github.com/ifzhang/ByteTrack.git
+git+https://github.com/microsoft/MoGe.git
+yolox==0.1.0
+
+# Инференс и работа с видео
+onnxruntime-gpu==1.21.0
+opencv-python==4.10.0.84
+
+# Научные и вспомогательные
+numpy==1.26.4
+Cython==3.2.4
+cython_bbox==0.1.5
+pycocotools  # последняя версия
+loguru==0.7.3
+tqdm==4.67.3
+matplotlib==3.10.9
+pandas==2.3.3
+scipy==1.15.3
+Pillow==12.2.0
+
+# Общие утилиты
+PyYAML==6.0.3
+requests==2.33.1
+packaging==26.2
+huggingface-hub==0.25.2
+filelock==3.29.0
+fsspec==2026.3.0
