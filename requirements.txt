@@ -5,7 +5,7 @@ torchaudio==2.11.0+cu130
 --extra-index-url https://download.pytorch.org/whl/cu130
 
 # Специфичные пакеты для трекинга и глубины
-git+https://github.com/ifzhang/ByteTrack.git
+boxmot
 git+https://github.com/microsoft/MoGe.git
 yolox==0.1.0
 
