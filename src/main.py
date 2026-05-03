@@ -1,4 +1,6 @@
 import os, sys, cv2, json, time, argparse, subprocess
+# Ваш токен HF
+#os.environ["HF_TOKEN"] = "hf_hash"
 from collections import deque
 import numpy as np
 
@@ -9,9 +11,13 @@ import onnxruntime as ort
 from pathlib import Path
 from dataclasses import dataclass
 
-# --- УДАЛЕНО: from yolox.tracker.byte_tracker import BYTETracker ---
-# --- ДОБАВЛЕНО: импорт BoTSORT из boxmot ---
-from boxmot import BoTSORT
+# --- Умный импорт BoTSORT для поддержки любой версии boxmot ---
+try:
+    from boxmot import BotSort
+    BoTSORT_CLASS = BotSort
+except ImportError:
+    from boxmot import BoTSORT
+    BoTSORT_CLASS = BoTSORT
 
 
 # ------------------------------------------------------------------ #
@@ -63,7 +69,7 @@ class YOLOv8Detector:
     NMS_THRESHOLD = 0.45
     MODEL_INPUT_SHAPE = (704, 1280)
 
-    def __init__(self, model_path, conf_thres=0.1, device='cuda'):
+    def __init__(self, model_path, conf_thres=0.45, device='cuda'):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
         self.session = ort.InferenceSession(model_path, providers=providers)
         print(f"[YOLO] Providers: {self.session.get_providers()}")
@@ -144,47 +150,57 @@ class YOLOv8Detector:
 
 
 # ------------------------------------------------------------------ #
-#  BoTSORT Tracker (Заменил ByteTrack)                                #
+#  BoTSORT Tracker (ИСПРАВЛЕННЫЙ)                                     #
 # ------------------------------------------------------------------ #
 class BoTSORTTracker:
     def __init__(self, frame_rate=30, device='cuda'):
-        # BoTSORT использует ReID-модель для выделения фичей (одежда, цвета и т.д.).
-        # 'osnet_x0_25_msmt17.pt' - хорошая, легкая модель. 
-        # BoxMOT скачает ее автоматически в первый раз.
-        self.tracker = BoTSORT(
-            model_weights=Path('osnet_x0_25_msmt17.pt'),
+        #  osnet_x0_25_msmt17.pt ->osnet_x1_0_msmt17.pt
+        self.tracker = BoTSORT_CLASS(
+            model_weights=Path('osnet_x1_0_msmt17.pt'),
             device=device,
             fp16=False,
+            track_high_thresh=0.5,   # Игнорируем слабые боксы-фантомы
+            track_low_thresh=0.1,    # Оставляем классический порог для 2-го прохода (перекрытия)
+            new_track_thresh=0.6,    # Жесткий порог: новый ID даем только уверенным детекциям
+            track_buffer=240,        # Память 8 сек (при 30fps), чтобы трек жил во время перекрытия
+            match_thresh=0.8,        # Строгий IoU матчинг
         )
+        self._prev_ids: set[int] = set()
 
-    def update(self, dets, frame):
-        """
-        dets: np.array формы (N, 5) -> [x1, y1, x2, y2, conf]
-        frame: оригинальное изображение (нужно для ReID и вычисления смещения камеры)
-        """
+    def update(self, dets: np.ndarray, frame: np.ndarray) -> list:
+        # Проверка на пустые детекции
         if dets.shape[0] == 0:
+            self.tracker.update(np.empty((0, 6), dtype=np.float32), frame)
+            self._prev_ids = set()
             return []
             
-        # BoxMOT ожидает формат [x1, y1, x2, y2, conf, cls]
-        # Так как YOLO-детектор отфильтрован по персонам (класс 0), просто добавляем колонку нулей
-        cls_col = np.zeros((dets.shape[0], 1))
-        dets_w_cls = np.hstack((dets, cls_col))
+        # Защита от битых/бесконечных боксов
+        valid_dets = dets[np.isfinite(dets).all(axis=1)]
+        if valid_dets.shape[0] == 0:
+            return []
+
+        cls_col    = np.zeros((valid_dets.shape[0], 1), dtype=np.float32)
+        dets_w_cls = np.hstack((valid_dets, cls_col))
         
-        # Обновляем трекер. На выходе: np.ndarray формы (N, 8) 
-        # -> [x1, y1, x2, y2, track_id, conf, cls, ind]
+        # Обновление трекера
         tracks = self.tracker.update(dets_w_cls, frame)
-        
-        # Имитируем старый объект из ByteTrack, чтобы не менять остальной код
+
         class TrackResult:
-            def __init__(self, x1, y1, x2, y2, track_id):
-                self.tlwh = [x1, y1, x2 - x1, y2 - y1] # top, left, width, height
-                self.track_id = int(track_id)
-        
+            __slots__ = ('tlwh', 'track_id')
+            def __init__(self, x1, y1, x2, y2, tid):
+                self.tlwh     = [float(x1), float(y1),
+                                 float(x2-x1), float(y2-y1)]
+                self.track_id = int(tid)
+
         results = []
         if tracks is not None and len(tracks) > 0:
             for t in tracks:
+                # Фильтр вырожденных bbox, из-за которых скачут координаты
+                if (t[2]-t[0]) < 10 or (t[3]-t[1]) < 10:
+                    continue
                 results.append(TrackResult(t[0], t[1], t[2], t[3], t[4]))
-                
+
+        self._prev_ids = {r.track_id for r in results}
         return results
 
 
@@ -469,7 +485,7 @@ def draw_bbox(img, bbox, track_id, speed_mps):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2)
 
 def draw_topdown_panel(active_data, panel_w=320, panel_h=720,
-                       max_depth_z=40.0, min_x=-20.0, max_x=20.0):
+                       max_depth_z=80.0, min_x=-30.0, max_x=30.0):
     panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
     panel[:] = (18, 18, 28)
     cv2.putText(panel, "2D TOP-DOWN VIEW", (12, 36),
@@ -516,12 +532,13 @@ def parse_args():
     p.add_argument('--video',       required=True)
     p.add_argument('--camera_id',   required=True)
     p.add_argument('--det_model',   default='yolov8n_best.onnx')
-    p.add_argument('--conf',        type=float, default=0.1)
+    # ИЗМЕНЕНО: По умолчанию 0.45 (важно для отсечения фантомов)
+    p.add_argument('--conf',        type=float, default=0.45)
     p.add_argument('--device',      default='cuda')
     p.add_argument('--output',      default='video_with_bbox_and_speed.mp4')
     p.add_argument('--out_width',   type=int, default=1280)
     p.add_argument('--out_height',  type=int, default=720)
-    p.add_argument('--panel_width', type=int, default=320)
+    p.add_argument('--panel_width', type=int, default=640)
     p.add_argument('--clahe',       type=float, default=0.0)
     p.add_argument('--denoise',     type=float, default=0.0)
     p.add_argument('--sharpen',     type=float, default=0.0)
@@ -575,8 +592,6 @@ def main():
 
     cuda_ok = 'CUDAExecutionProvider' in ort.get_available_providers()
     
-    # Для BoxMOT формат девайса обычно должен быть 'cuda:0', 
-    # тогда как ONNX может ожидать просто 'cuda'. Форматируем для трекера отдельно:
     device_onnx = args.device if (args.device == 'cuda' and cuda_ok) else 'cpu'
     device_tracker = 'cuda:0' if device_onnx == 'cuda' else 'cpu'
     
@@ -585,7 +600,6 @@ def main():
 
     detector  = YOLOv8Detector(args.det_model, conf_thres=args.conf, device=device_onnx)
     
-    # --- Изменение 1: Инстанцируем новый трекер ---
     tracker   = BoTSORTTracker(frame_rate=fps, device=device_tracker)
     
     speed_est = SpeedEstimator(
@@ -611,20 +625,16 @@ def main():
         frame   = apply_filters(frame, args.clahe, args.denoise, args.sharpen)
         dets    = detector.detect(frame)
         
-        # --- Изменение 2: Передаем кадр в метод update ---
         targets = tracker.update(dets, frame)
 
         active_data = {}
         for t in targets:
-            bbox = t.tlwh.copy()
-            bbox[2] += bbox[0]
-            bbox[3] += bbox[1]
+            bbox = [t.tlwh[0], t.tlwh[1],
+                    t.tlwh[0] + t.tlwh[2],
+                    t.tlwh[1] + t.tlwh[3]]
             speed = speed_est.update(t.track_id, bbox, video_time)
-            hist = list(speed_est.history.get(t.track_id, []))
-            active_data[t.track_id] = {
-                'speed': speed,
-                'history': hist
-            }
+            hist  = list(speed_est.history.get(t.track_id, []))
+            active_data[t.track_id] = {'speed': speed, 'history': hist}
             draw_bbox(frame, bbox, t.track_id, speed)
 
         composed = compose_frame(frame, active_data,
