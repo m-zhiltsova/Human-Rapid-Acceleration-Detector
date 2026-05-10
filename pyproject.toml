@@ -1,0 +1,55 @@
+[project]
+name = "tracking-project"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.11.0+cu130",
+    "torchvision==0.26.0+cu130",
+    "torchaudio==2.11.0+cu130",
+    "boxmot",
+    "moge",
+    "yolox",
+    "onnxruntime-gpu==1.21.0",
+    "opencv-python==4.10.0.84",
+    "numpy==1.26.4",
+    "Cython==3.2.4",
+    "pycocotools",
+    "loguru==0.7.3",
+    "tqdm==4.67.3",
+    "matplotlib==3.10.9",
+    "pandas==2.3.3",
+    "scipy==1.15.3",
+    "Pillow==12.2.0",
+    "PyYAML==6.0.3",
+    "requests==2.33.1",
+    "packaging==26.2",
+    "huggingface-hub==0.25.2",
+    "filelock==3.29.0",
+    "fsspec==2026.3.0",
+]
+
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+
+[tool.uv.sources]
+cython_bbox = { git = "https://github.com/siddhantgarg/cython_bbox.git", rev = "v0.1.3" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+moge = { git = "https://github.com/microsoft/MoGe.git" }
+yolox = { git = "https://github.com/Megvii-BaseDetection/YOLOX.git", rev = "0.1.0" }
+
+[tool.uv.extra-build-dependencies]
+yolox = ["setuptools", "torch==2.11.0+cu130"]
+cython-bbox = ["cython", "numpy"]
+
+[tool.uv.build-env]
+CC = "gcc"
+CXX = "g++"
+
+[tool.uv.extra-build-variables]
+CC = "gcc"
+CXX = "g++"
