@@ -67,7 +67,7 @@ def apply_filters(frame, clahe_clip=0.0, denoise_h=0.0, sharpen_amount=0.0):
 class YOLOv8Detector:
     PERSON_CLASS_ID = 0
     NMS_THRESHOLD = 0.45
-    MODEL_INPUT_SHAPE = (704, 1280)
+    MODEL_INPUT_SHAPE = (576, 1024)
 
     def __init__(self, model_path, conf_thres=0.45, device='cuda'):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
@@ -156,9 +156,9 @@ class BoTSORTTracker:
     def __init__(self, frame_rate=30, device='cuda'):
         #  osnet_x0_25_msmt17.pt ->osnet_x1_0_msmt17.pt
         self.tracker = BoTSORT_CLASS(
-            model_weights=Path('osnet_x1_0_msmt17.pt'),
+            reid_weights=Path('osnet_x1_0_msmt17.pt'),
             device=device,
-            fp16=False,
+            half=False,
             track_high_thresh=0.5,   # Игнорируем слабые боксы-фантомы
             track_low_thresh=0.1,    # Оставляем классический порог для 2-го прохода (перекрытия)
             new_track_thresh=0.6,    # Жесткий порог: новый ID даем только уверенным детекциям
